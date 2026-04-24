@@ -1,0 +1,2432 @@
+---
+title: Centralization and integration in Tairona chiefdoms of the Río Frío basin,
+  Sierra Nevada de Santa Marta, Colombia
+author: "Luis Miguel Soto Rodriguez, University of Pittsburgh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+    fig_width: 11
+    fig_height: 8.5
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, dpi=300)
+```
+
+## 1. Definition of the working environment
+```{r section_1_definition_of_the_working_environment}
+repo_base <- "https://raw.githubusercontent.com/luismiguelsoto/Centralization_and_integration_in_Tairona_chiefdoms_of_the_Rio_Frio_basin/main/GIS"
+
+folder <- file.path(tempdir(), "JARE_GIS_DATA")
+if (!dir.exists(folder)) dir.create(folder, recursive = TRUE)
+
+gis_files <- c(
+"DEM_POLYGON_52KM.tif",
+  "LOCAL_COMMUNITIES.cpg", "LOCAL_COMMUNITIES.dbf", "LOCAL_COMMUNITIES.prj",
+  "LOCAL_COMMUNITIES.qmd", "LOCAL_COMMUNITIES.shp", "LOCAL_COMMUNITIES.shx",
+  "regression_data.rds",
+  "POLYGON_SURVEY_RIO_FRIO.cpg", "POLYGON_SURVEY_RIO_FRIO.dbf", "POLYGON_SURVEY_RIO_FRIO.prj",
+  "POLYGON_SURVEY_RIO_FRIO.qmd", "POLYGON_SURVEY_RIO_FRIO.shp", "POLYGON_SURVEY_RIO_FRIO.shx",
+  "RIVER_POLYGON_52KM.cpg", "RIVER_POLYGON_52KM.dbf", "RIVER_POLYGON_52KM.prj",
+  "RIVER_POLYGON_52KM.qmd", "RIVER_POLYGON_52KM.shp", "RIVER_POLYGON_52KM.shx",
+  "SOILS_AGRICULTURE_RASTER_52KM.tif", "TAIRONA_CERAMICS.rds",
+  "TAIRONA_POLYGONS_SITES.cpg", "TAIRONA_POLYGONS_SITES.dbf", "TAIRONA_POLYGONS_SITES.prj",
+  "TAIRONA_POLYGONS_SITES.qmd", "TAIRONA_POLYGONS_SITES.shp", "TAIRONA_POLYGONS_SITES.shx",
+  "TAIRONA_STRUCTURES.cpg", "TAIRONA_STRUCTURES.dbf", "TAIRONA_STRUCTURES.prj",
+  "TAIRONA_STRUCTURES.qmd", "TAIRONA_STRUCTURES.shp", "TAIRONA_STRUCTURES.shx"
+)
+
+cat("Downloading GIS files from GitHub repository...\n")
+for (f in gis_files) {
+  dest_path <- file.path(folder, f)
+  if (!file.exists(dest_path)) {
+    url <- paste0(repo_base, "/", f)
+    tryCatch(download.file(url, destfile = dest_path, mode = "wb", quiet = TRUE),
+             error = function(e) warning(paste("Could not download:", f, "-", e$message)))
+  }
+}
+cat("Downloaded", length(list.files(folder)), "of", length(gis_files), "files.\n")
+
+stopifnot(dir.exists(folder))
+options(digits = 6, scipen = 50)
+set.seed(123)
+
+packages <- c("sf","lwgeom","terra","car","spatstat.geom","spatstat.random",
+  "ggplot2","ggspatial","patchwork","dplyr","viridis","scales",
+  "raster","sp","movecost","igraph","knitr","dunn.test",
+  "readxl","mgcv","gratia","tidyr","tibble","RColorBrewer",
+  "MASS","mice","sandwich","lmtest","betareg")
+to_install <- setdiff(packages, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(packages, function(p) suppressPackageStartupMessages(library(p, character.only = TRUE))))
+
+shps <- list.files(folder, pattern = "\\.shp$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+tifs <- list.files(folder, pattern = "\\.(tif|tiff)$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+if (length(shps) == 0) stop("No .shp files found.")
+if (length(tifs) == 0) warning("No .tif/.tiff files found.")
+
+pick_file <- function(patterns, files_vec) {
+  for (pt in patterns) { hit <- grep(pt, files_vec, ignore.case = TRUE, value = TRUE); if (length(hit) >= 1) return(hit[1]) }
+  NA_character_
+}
+
+shp_survey     <- pick_file(c("POLYGON_SURVEY_RIO_FRIO\\.shp$"), shps)
+shp_structures <- pick_file(c("TAIRONA_STRUCTURES\\.shp$"), shps)
+shp_sites_poly <- pick_file(c("TAIRONA_POLYGONS_SITES\\.shp$"), shps)
+shp_localcom   <- pick_file(c("LOCAL_COMMUNITIES\\.shp$"), shps)
+tif_soils      <- pick_file(c("SOILS_AGRICULTURE_RASTER_52KM\\.(tif|tiff)$"), tifs)
+shp_river      <- pick_file(c("RIVER_POLYGON_52KM\\.shp$"), shps)
+
+stopifnot(!is.na(shp_survey), file.exists(shp_survey))
+stopifnot(!is.na(shp_structures), file.exists(shp_structures))
+stopifnot(!is.na(shp_sites_poly), file.exists(shp_sites_poly))
+stopifnot(!is.na(tif_soils), file.exists(tif_soils))
+
+target_crs <- 32618
+```
+
+## 2. Nearest neighbor analysis
+```{r section_2_nearest_neighbor_analysis}
+survey_sf <- sf::st_read(shp_survey, quiet = TRUE) |>
+  sf::st_transform(target_crs) |>
+  sf::st_zm(drop = TRUE, what = "ZM") |>
+  sf::st_make_valid()
+
+survey_union <- survey_sf |>
+  sf::st_union() |>
+  sf::st_make_valid() |>
+  sf::st_collection_extract("POLYGON")
+
+survey_union_sf <- sf::st_sf(geometry = survey_union)
+survey_v <- terra::vect(survey_union_sf)
+
+struc_sf <- sf::st_read(shp_structures, quiet = TRUE) |>
+  sf::st_transform(target_crs)
+
+struc_sf_xy <- sf::st_zm(struc_sf, drop = TRUE, what = "ZM")
+
+inside <- sf::st_within(struc_sf_xy, survey_union, sparse = FALSE)[, 1]
+struc_sf_xy <- struc_sf_xy[inside, , drop = FALSE]
+
+coords <- sf::st_coordinates(struc_sf_xy)
+Tairona_data <- data.frame(UTM_East = coords[, 1], UTM_North = coords[, 2])
+
+x_col <- "UTM_East"
+y_col <- "UTM_North"
+
+n <- nrow(Tairona_data)
+stopifnot(n > 1)
+
+A_m2  <- as.numeric(sf::st_area(survey_union))
+A_km2 <- A_m2 / 1e6
+
+sites_poly_sf <- sf::st_read(shp_sites_poly, quiet = TRUE) |>
+  sf::st_transform(target_crs) |>
+  sf::st_make_valid()
+
+local_comm_sf <- NULL
+if (!is.na(shp_localcom) && file.exists(shp_localcom)) {
+  local_comm_sf <- sf::st_read(shp_localcom, quiet = TRUE) |>
+    sf::st_transform(target_crs)
+}
+
+soils_r <- terra::rast(tif_soils)
+
+if (!is.na(terra::crs(soils_r)) && terra::crs(soils_r) != sf::st_crs(target_crs)$wkt) {
+  soils_r <- terra::project(soils_r, sf::st_crs(target_crs)$wkt, method = "near")
+}
+
+soils_r <- terra::crop(soils_r, survey_v)
+soils_r <- terra::mask(soils_r, survey_v)
+
+names(soils_r) <- "SOILS_CLASS"
+
+sf_to_owin_manual <- function(poly_sf) {
+  g <- sf::st_geometry(poly_sf)
+  g <- g[!sf::st_is_empty(g)]
+  g <- sf::st_cast(g, "MULTIPOLYGON", warn = FALSE)
+
+  cc <- sf::st_coordinates(g)
+  cc <- as.data.frame(cc)
+  needed <- c("X", "Y", "L1", "L2", "L3")
+  stopifnot(all(needed %in% names(cc)))
+
+  mk_ring <- function(df) list(x = df$X, y = df$Y)
+
+  ow_list <- list()
+  idx <- 0
+
+  feats <- unique(cc$L1)
+  for (f in feats) {
+    cc_f <- cc[cc$L1 == f, , drop = FALSE]
+    polys <- unique(cc_f$L2)
+
+    for (p in polys) {
+      cc_p <- cc_f[cc_f$L2 == p, , drop = FALSE]
+      rings <- sort(unique(cc_p$L3))
+
+      outer_df <- cc_p[cc_p$L3 == rings[1], , drop = FALSE]
+      outer <- mk_ring(outer_df)
+
+      holes <- NULL
+      if (length(rings) > 1) {
+        holes <- lapply(rings[-1], function(rg) mk_ring(cc_p[cc_p$L3 == rg, , drop = FALSE]))
+      }
+
+      idx <- idx + 1
+      ow_list[[idx]] <- if (is.null(holes)) {
+        spatstat.geom::owin(poly = outer)
+      } else {
+        spatstat.geom::owin(poly = outer, hole = holes)
+      }
+    }
+  }
+
+  W <- ow_list[[1]]
+  if (length(ow_list) > 1) {
+    for (k in 2:length(ow_list)) W <- spatstat.geom::union.owin(W, ow_list[[k]])
+  }
+  W
+}
+
+W <- tryCatch(
+  spatstat.geom::as.owin(sf::st_geometry(survey_union_sf)),
+  error = function(e) sf_to_owin_manual(survey_union_sf)
+)
+
+pp <- spatstat.geom::ppp(
+  x      = Tairona_data[[x_col]],
+  y      = Tairona_data[[y_col]],
+  window = W
+)
+
+if (any(duplicated(spatstat.geom::coords(pp)))) {
+  pp <- spatstat.random::rjitter(pp, radius = 0.001)
+}
+
+NND  <- spatstat.geom::nndist(pp)
+MNND <- mean(NND)
+SDND <- sd(NND)
+
+lambda  <- n / A_m2
+EXPNND  <- 0.5 / sqrt(lambda)
+R_index <- MNND / EXPNND
+
+SE_mnnd         <- (0.26136 * sqrt(A_m2)) / n
+z_ce            <- (MNND - EXPNND) / SE_mnnd
+p_ce_two_sided  <- 2 * stats::pnorm(-abs(z_ce))
+
+nsim <- 999
+mnnd_sim <- replicate(nsim, {
+  sim_pp <- spatstat.random::runifpoint(n, win = W)
+  mean(spatstat.geom::nndist(sim_pp))
+})
+
+p_lower        <- (1 + sum(mnnd_sim <= MNND)) / (nsim + 1)
+p_upper        <- (1 + sum(mnnd_sim >= MNND)) / (nsim + 1)
+p_mc_two_sided <- min(1, 2 * min(p_lower, p_upper))
+
+ce_test <- spatstat.explore::clarkevans.test(pp, correction = "cdf", nsim = 999)
+
+get_first_numeric <- function(obj) {
+  if (is.null(obj) || length(obj) == 0) return(NA_real_)
+  suppressWarnings(as.numeric(obj[1]))
+}
+
+CE_p <- get_first_numeric(ce_test$p.value)
+if (is.na(CE_p)) CE_p <- get_first_numeric(ce_test$p)
+
+CE_R <- get_first_numeric(ce_test$R)
+if (is.na(CE_R)) {
+  CE_R <- get_first_numeric(ce_test$statistic[names(ce_test$statistic) %in% c("R", "r", "R (Clark-Evans)")])
+}
+
+NN_report <- data.frame(
+  N_points         = n,
+  Area_m2          = round(A_m2, 2),
+  Area_km2         = round(A_km2, 5),
+  Intensity_lambda = signif(lambda, 6),
+  MNND_observed_m  = round(MNND, 3),
+  SD_NND_m         = round(SDND, 3),
+  MNND_expected_m  = round(EXPNND, 3),
+  R_index          = round(R_index, 4),
+  SE_MNND_m        = round(SE_mnnd, 4),
+  z_approx         = round(z_ce, 3),
+  p_approx_2s      = signif(p_ce_two_sided, 4),
+  p_MC_CSR_2s      = signif(p_mc_two_sided, 4),
+  nsim_MC          = nsim,
+  CE_R             = round(CE_R, 4),
+  CE_p_value       = signif(CE_p, 4)
+)
+
+conf_levels <- c(0.80, 0.90, 0.95, 0.99)
+tcrit <- sapply(conf_levels, function(cl) stats::qt(1 - (1 - cl) / 2, df = n - 1))
+
+ME      <- tcrit * (SDND / sqrt(n))
+CI_low  <- MNND - ME
+CI_high <- MNND + ME
+
+CI_table <- data.frame(
+  Confidence = paste0(conf_levels * 100, "%"),
+  Mean_MNND  = round(MNND, 3),
+  Margin     = round(ME, 3),
+  CI_Lower   = round(CI_low, 3),
+  CI_Upper   = round(CI_high, 3)
+)
+
+nn_summary_tbl <- data.frame(
+  Metric = c(
+    "Number of terraces",
+    "Survey area (km2)",
+    "Observed mean NND (m)",
+    "Expected mean NND (m)",
+    "Simple R index",
+    "Clark-Evans R (CDF corrected)",
+    "Clark-Evans p-value"
+  ),
+  Value = c(
+    format(n, big.mark = ","),
+    sprintf("%.4f", A_km2),
+    sprintf("%.3f", MNND),
+    sprintf("%.3f", EXPNND),
+    sprintf("%.4f", R_index),
+    sprintf("%.4f", CE_R),
+    ifelse(CE_p < 0.001, "< 0.001", format(signif(CE_p, 4), scientific = FALSE))
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(nn_summary_tbl, caption = "Nearest-neighbor analysis: manuscript-statistics summary")
+
+nx_hi <- 2000
+ny_hi <- 2000
+SIGMA_MULT <- 9.5
+
+bw_default <- spatstat.explore::bw.diggle(pp)
+sigma_use  <- as.numeric(bw_default) * SIGMA_MULT
+
+dens_im <- spatstat.explore::density.ppp(
+  pp, sigma = sigma_use, edge = TRUE, at = "pixels", dimyx = c(ny_hi, nx_hi)
+)
+
+dens_df <- as.data.frame(dens_im)
+names(dens_df) <- c("x", "y", "z")
+
+p_kde <- ggplot() +
+  geom_sf(data = survey_union_sf, fill = "grey85", color = "black", linewidth = 0.6) +
+  geom_raster(data = dens_df, aes(x = x, y = y, fill = z)) +
+  geom_point(
+    data = Tairona_data,
+    aes(x = .data[[x_col]], y = .data[[y_col]]),
+    size = 0.18, alpha = 0.55
+  ) +
+  viridis::scale_fill_viridis(option = "plasma", direction = 1, name = "Density") +
+  coord_sf(crs = sf::st_crs(target_crs), datum = NA) +
+  ggspatial::annotation_north_arrow(
+    location = "tl", which_north = "true",
+    style = ggspatial::north_arrow_fancy_orienteering
+  ) +
+  ggspatial::annotation_scale(
+    location = "br", unit_category = "metric",
+    text_cex = 0.9, line_width = 0.8
+  ) +
+  labs(
+    title = "Kernel density of terraces (TAIRONA_STRUCTURES) — real survey polygon (~52 km²)",
+    subtitle = paste0(
+      "bw.diggle = ", round(as.numeric(bw_default), 2),
+      " m | sigma = bw * ", SIGMA_MULT,
+      " = ", round(sigma_use, 2),
+      " m | Resolution = ", nx_hi, "×", ny_hi
+    ),
+    x = "East (m)", y = "North (m)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right", plot.title = element_text(face = "bold"))
+
+df_nnd <- data.frame(NND = NND)
+
+ci_text <- paste0(
+  paste0(CI_table$Confidence, ": ", CI_table$Mean_MNND, " \u00B1 ", CI_table$Margin),
+  collapse = "\n"
+)
+
+p_hist <- ggplot(df_nnd, aes(x = NND)) +
+  geom_histogram(binwidth = 10, fill = "black", color = "black") +
+  geom_vline(xintercept = MNND, linetype = "dashed", linewidth = 0.9, color = "red") +
+  geom_vline(xintercept = MNND - SDND, linetype = "dashed", linewidth = 0.9, color = "blue") +
+  geom_vline(xintercept = MNND + SDND, linetype = "dashed", linewidth = 0.9, color = "blue") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.05, label = ci_text, size = 3.6) +
+  labs(
+    title = "Nearest-neighbor distances (NND) — histogram",
+    subtitle = paste0("Mean = ", round(MNND, 2), " m | SD = ", round(SDND, 2), " m"),
+    x = "Distance (m)", y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold"))
+
+(p_kde / p_hist) + patchwork::plot_layout(heights = c(2.2, 1.2))
+```
+
+## 3. Ripley's K
+```{r section_3_ripleys_k}
+fmt_time <- function(sec) {
+  if (is.na(sec)) return("NA")
+  if (sec < 60) return(paste0(round(sec, 1), " s"))
+  if (sec < 3600) return(paste0(round(sec/60, 1), " min"))
+  paste0(round(sec/3600, 2), " h")
+}
+
+t0 <- proc.time()
+L <- spatstat.explore::Lest(pp, correction = c("iso","trans","border"))
+tL <- (proc.time() - t0)[["elapsed"]]
+cat("Ripley Lest():", fmt_time(tL), "\n")
+
+t0 <- proc.time()
+g <- spatstat.explore::pcf(pp, correction = c("iso","trans"))
+tg <- (proc.time() - t0)[["elapsed"]]
+cat("Pair correlation pcf():", fmt_time(tg), "\n")
+
+nsim_final <- 99
+nsim_pilot <- 9
+
+t0 <- proc.time()
+envK_pilot <- spatstat.explore::envelope(
+  pp, fun = spatstat.explore::Kest,
+  nsim = nsim_pilot, correction = "best",
+  global = FALSE, verbose = FALSE
+)
+tp <- (proc.time() - t0)[["elapsed"]]
+est_total <- tp * (nsim_final / nsim_pilot)
+
+cat("K-envelope pilot (", nsim_pilot, " sims): ", fmt_time(tp),
+    " | Estimated for ", nsim_final, " sims: ", fmt_time(est_total), "\n", sep = "")
+
+t0 <- proc.time()
+envK <- spatstat.explore::envelope(
+  pp, fun = spatstat.explore::Kest,
+  nsim = nsim_final, correction = "best",
+  global = FALSE, verbose = FALSE
+)
+tK <- (proc.time() - t0)[["elapsed"]]
+cat("K-envelope final (", nsim_final, " sims): ", fmt_time(tK), "\n", sep = "")
+
+L_df <- as.data.frame(L)
+g_df <- as.data.frame(g)
+E_df <- as.data.frame(envK)
+
+pick_col <- function(df, x) {
+  h <- intersect(x, names(df))
+  if (length(h)) h[1] else NA_character_
+}
+
+colL <- pick_col(L_df, c("iso","trans","border","km"))
+stopifnot(!is.na(colL))
+L_df$L_minus_r <- L_df[[colL]] - L_df$r
+
+col_obs <- pick_col(E_df, c("obs","iso","trans","border"))
+col_lo  <- pick_col(E_df, c("lo","low","loiso","lo.trans"))
+col_hi  <- pick_col(E_df, c("hi","high","hiiso","hi.trans"))
+stopifnot(!any(is.na(c(col_obs, col_lo, col_hi))))
+
+E_df$obs <- E_df[[col_obs]]
+E_df$lo  <- E_df[[col_lo]]
+E_df$hi  <- E_df[[col_hi]]
+
+E_df$pattern <- dplyr::case_when(
+  E_df$obs > E_df$hi ~ "Clustered",
+  E_df$obs < E_df$lo ~ "Regular / Dispersed",
+  TRUE              ~ "Not significant"
+)
+
+iL <- which.max(L_df$L_minus_r)
+ig <- which.max(g_df$iso)
+
+ripley_summary <- data.frame(
+  Metric = c(
+    "Number of points",
+    "CSR simulations",
+    "Maximum L(r) − r (m)",
+    "Distance at max L(r) − r (m)",
+    "Maximum g(r)",
+    "Distance at max g(r) (m)",
+    "Percent of distances clustered",
+    "Percent of distances dispersed"
+  ),
+  Value = c(
+    spatstat.geom::npoints(pp),
+    nsim_final,
+    round(L_df$L_minus_r[iL], 2),
+    round(L_df$r[iL], 0),
+    round(g_df$iso[ig], 2),
+    round(g_df$r[ig], 0),
+    round(mean(E_df$pattern == "Clustered") * 100, 1),
+    round(mean(E_df$pattern == "Regular / Dispersed") * 100, 1)
+  ),
+  stringsAsFactors = FALSE
+)
+
+scale_table <- E_df |>
+  dplyr::mutate(grp = cumsum(pattern != dplyr::lag(pattern, default = first(pattern)))) |>
+  dplyr::group_by(pattern, grp) |>
+  dplyr::summarise(
+    r_min = min(r, na.rm = TRUE),
+    r_max = max(r, na.rm = TRUE),
+    span  = r_max - r_min,
+    .groups = "drop"
+  ) |>
+  dplyr::filter(pattern != "Not significant") |>
+  dplyr::mutate(
+    Distance_range_m = paste0(round(r_min, 0), "–", round(r_max, 0)),
+    Scale_width_m    = round(span, 0)
+  ) |>
+  dplyr::select(
+    Spatial_pattern = pattern,
+    Distance_range_m,
+    Scale_width_m
+  )
+
+if (nrow(scale_table) == 0) {
+  scale_table <- data.frame(
+    Spatial_pattern = "Not significant",
+    Distance_range_m = NA_character_,
+    Scale_width_m = NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+knitr::kable(ripley_summary, caption = "Ripley's K: manuscript-statistics summary")
+knitr::kable(scale_table, caption = "Ripley's K: significant distance range")
+
+oldpar <- par(no.readonly = TRUE)
+par(mfrow = c(3, 1), mar = c(4, 4, 2.2, 1), las = 1)
+
+plot(L, . - r ~ r, main = "A. Ripley’s L(r) − r", legendargs = list(cex = 0.8, xpd = NA))
+abline(h = 0, lty = 3)
+
+plot(g, main = "B. Pair correlation function g(r)", legendargs = list(cex = 0.8, xpd = NA))
+abline(h = 1, lty = 3)
+
+plot(envK,
+     main = paste0("C. K-function envelope (CSR, ", nsim_final, " simulations)"),
+     legendargs = list(cex = 0.8, xpd = NA))
+
+par(oldpar)
+```
+
+## 4. Evaluation of settlement hierarchies (Rank-Size / A coefficient)
+```{r section_4_rank_size_a_coefficient}
+compute_A_coefficient <- function(sizes_vec){
+  s <- sort(sizes_vec, decreasing = TRUE)
+  n <- length(s)
+  
+  if(n < 2) return(c(A = NA_real_, A1 = NA_real_, A2 = NA_real_))
+  
+  r <- seq_len(n)
+  x     <- log(r) / log(n)
+  y_ref <- 1 - x
+  y_obs <- (log(s) - log(max(s)) + log(n)) / log(n)
+  
+  d  <- y_obs - y_ref
+  dx <- diff(x)
+  
+  A  <- sum((head(d, -1) + tail(d, -1)) / 2 * dx)
+  A1 <- sum((pmax(head(d, -1), 0) + pmax(tail(d, -1), 0)) / 2 * dx)
+  A2 <- sum((pmin(head(d, -1), 0) + pmin(tail(d, -1), 0)) / 2 * dx)
+  
+  c(A = A, A1 = A1, A2 = A2)
+}
+
+calculate_A_rsboot <- function(sizes, confidence_levels = 90, R = 10000, seed = 1){
+  set.seed(seed)
+  
+  s <- sort(sizes, decreasing = TRUE)
+  n <- length(s)
+  
+  A_obs <- as.numeric(compute_A_coefficient(s)["A"])
+  
+  A_boot <- replicate(R, {
+    ss <- sort(sample(s, n, replace = TRUE), decreasing = TRUE)
+    as.numeric(compute_A_coefficient(ss)["A"])
+  })
+  
+  A_boot_c <- as.numeric(A_boot + (A_obs - mean(A_boot)))
+  
+  ci_matrix <- sapply(confidence_levels, function(cl){
+    if (cl <= 1) cl <- cl * 100
+    alpha <- 1 - cl / 100
+    stats::quantile(A_boot_c, probs = c(alpha/2, 1 - alpha/2), names = FALSE, type = 7)
+  })
+  
+  if (is.null(dim(ci_matrix))) ci_matrix <- matrix(ci_matrix, nrow = 2)
+  rownames(ci_matrix) <- c("Lower", "Upper")
+  
+  list(A = A_obs, ci = ci_matrix, A_boot_c = A_boot_c)
+}
+
+zone_curves_rsboot <- function(sizes, confidence_level = 90, R = 12000, seed = 1){
+  set.seed(seed)
+  
+  s <- sort(sizes, decreasing = TRUE)
+  n <- length(s)
+  r <- seq_len(n)
+  smax <- max(s)
+  
+  boot_samps <- replicate(R, sort(sample(s, n, replace = TRUE), decreasing = TRUE))
+  keep <- apply(boot_samps, 2, function(col) max(col) == smax)
+  boot_samps <- boot_samps[, keep, drop = FALSE]
+  
+  A_obs <- as.numeric(compute_A_coefficient(s)["A"])
+  A_bs  <- apply(boot_samps, 2, function(col) as.numeric(compute_A_coefficient(col)["A"]))
+  A_bs  <- as.numeric(A_bs + (A_obs - mean(A_bs)))
+  
+  cl <- confidence_level
+  if (cl <= 1) cl <- cl * 100
+  alpha <- 1 - cl / 100
+  
+  q_lo <- stats::quantile(A_bs, probs = alpha/2,     names = FALSE, type = 7)
+  q_hi <- stats::quantile(A_bs, probs = 1 - alpha/2, names = FALSE, type = 7)
+  
+  idx_lo <- which.min(abs(A_bs - q_lo))
+  idx_hi <- which.min(abs(A_bs - q_hi))
+  
+  list(
+    ranks       = r,
+    lower_curve = boot_samps[, idx_lo],
+    upper_curve = boot_samps[, idx_hi]
+  )
+}
+
+plot_rank_size <- function(sizes, confidence_level = 90,
+                           R_zone = 12000, seed = 1,
+                           A_val = NULL, A_ci = NULL){
+  sizes_sorted <- sort(sizes, decreasing = TRUE)
+  ranks        <- seq_along(sizes_sorted)
+  lognorm      <- max(sizes_sorted) * ranks^-1
+  
+  zone <- zone_curves_rsboot(sizes_sorted, confidence_level, R = R_zone, seed = seed)
+  
+  df <- data.frame(
+    Rank      = ranks,
+    Observed  = sizes_sorted,
+    LogNormal = lognorm,
+    UpperCI   = zone$upper_curve,
+    LowerCI   = zone$lower_curve
+  )
+  
+  title_str <- paste0(
+    "Rank–Size Plot (", confidence_level, "% CI, RSBOOT-style)",
+    if (!is.null(A_val) && !is.null(A_ci)) {
+      sprintf("\nA = %.3f  (%d%% CI: %.3f to %.3f)", A_val, confidence_level, A_ci[1], A_ci[2])
+    } else ""
+  )
+  
+  ggplot(df, aes(x = Rank)) +
+    geom_ribbon(aes(ymin = LowerCI, ymax = UpperCI), fill = "grey80", alpha = 0.4) +
+    geom_line(aes(y = Observed,  color = "Observed"),   linewidth = 1) +
+    geom_line(aes(y = LogNormal, color = "Log-Normal"), linetype = "dashed", linewidth = 1) +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(title = title_str, x = "Rank", y = "Settlement size (ha)", color = "Legend") +
+    theme_bw()
+}
+
+confidence_level_target <- 90
+confidence_levels <- confidence_level_target
+seed_rsboot <- 2025236
+
+size_field_poly <- if ("Site_size" %in% names(sites_poly_sf)) "Site_size" else {
+  cands <- grep("size|area|ha", names(sites_poly_sf), ignore.case = TRUE, value = TRUE)
+  if (length(cands)) cands[1] else stop("No site size/area field was found in TAIRONA_POLYGONS_SITES.")
+}
+
+settlement_sizes <- as.numeric(sites_poly_sf[[size_field_poly]])
+settlement_sizes <- settlement_sizes[is.finite(settlement_sizes) & settlement_sizes > 0]
+stopifnot(length(settlement_sizes) >= 3)
+
+results <- calculate_A_rsboot(
+  settlement_sizes,
+  confidence_levels = confidence_levels,
+  R = 10000,
+  seed = seed_rsboot
+)
+
+A_coef <- results$A
+ci_mat <- results$ci
+ci_90  <- as.numeric(ci_mat[, 1])
+
+a_summary_tbl <- data.frame(
+  Statistic = c("A coefficient", "Number of settlements", "Confidence level", "CI lower", "CI upper"),
+  Value = c(sprintf("%.3f", A_coef), length(settlement_sizes), confidence_levels, sprintf("%.3f", ci_90[1]), sprintf("%.3f", ci_90[2])),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(a_summary_tbl, caption = "Rank-size analysis: manuscript-statistics summary")
+
+ci_table <- data.frame(
+  Confidence_Level = confidence_levels,
+  Lower_Bound      = round(ci_90[1], 3),
+  Upper_Bound      = round(ci_90[2], 3)
+)
+
+p_rank90 <- plot_rank_size(
+  settlement_sizes,
+  confidence_level = confidence_level_target,
+  R_zone = 12000,
+  seed = seed_rsboot,
+  A_val = A_coef,
+  A_ci  = round(ci_90, 3)
+)
+
+p_map <- ggplot() +
+  geom_sf(data = survey_union, fill = "grey98", color = "black", linewidth = 0.3) +
+  geom_sf(data = sites_poly_sf, aes(fill = .data[[size_field_poly]]), color = NA) +
+  scale_fill_viridis_c(name = "Site size (ha)", option = "viridis", trans = "sqrt") +
+  labs(
+    title = "Spatial distribution of Tairona sites (polygons) colored by size",
+    subtitle = paste0("Shapefile: ", basename(shp_sites_poly), " | Field: ", size_field_poly),
+    x = "UTM Easting (m)",
+    y = "UTM Northing (m)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = c(0.85, 0.25), panel.grid = element_blank())
+
+print((p_rank90 / p_map) + patchwork::plot_layout(heights = c(1.05, 1.35)))
+```
+
+## 5. Evaluation of demographic centralization (B values)
+```{r section_5_demographic_centralization_b_values}
+n_rings  <- 12
+dist_max <- 5992.292
+center_x <- 599413
+center_y <- 1212647
+
+area_total    <- A_m2
+area_per_ring <- area_total / n_rings
+cum_areas     <- cumsum(rep(area_per_ring, n_rings))
+radii         <- sqrt(cum_areas / pi)
+scale_factor  <- dist_max / max(radii)
+radii_scaled  <- radii * scale_factor
+
+center_pt <- sf::st_sfc(sf::st_point(c(center_x, center_y)), crs = sf::st_crs(survey_union))
+
+rings_list <- vector("list", n_rings)
+for (i in seq_len(n_rings)) {
+  outer <- sf::st_buffer(center_pt, dist = radii_scaled[i])
+  if (i == 1) {
+    ring <- outer
+  } else {
+    inner <- sf::st_buffer(center_pt, dist = radii_scaled[i - 1])
+    ring  <- sf::st_difference(outer, inner)
+  }
+  rings_list[[i]] <- sf::st_intersection(ring, survey_union)
+}
+
+valid_rings <- Filter(function(x) !sf::st_is_empty(x), rings_list)
+
+rings_sf <- do.call(rbind, lapply(seq_along(valid_rings), function(i) {
+  sf::st_sf(geometry = valid_rings[[i]], ring = i)
+})) |>
+  sf::st_make_valid()
+
+counts <- sapply(valid_rings, function(r) {
+  sum(sf::st_within(struc_sf_xy, r, sparse = FALSE))
+})
+rings_sf$count <- as.integer(counts)
+
+table_rings <- data.frame(
+  Ring                 = rings_sf$ring,
+  Radius_m             = radii_scaled[seq_len(nrow(rings_sf))],
+  Estimated_Structures = rings_sf$count
+)
+
+total_structures <- sum(table_rings$Estimated_Structures)
+
+table_rings$Proportion_exact      <- table_rings$Estimated_Structures / total_structures
+table_rings$Cumulative_exact      <- cumsum(table_rings$Proportion_exact)
+table_rings$Proportion            <- round(table_rings$Proportion_exact * 100, 1)
+table_rings$Cumulative_Proportion <- round(table_rings$Cumulative_exact * 100, 1)
+
+calc_CI_90 <- function(p, n) {
+  if (n == 0) return(c(NA_real_, NA_real_))
+  se <- sqrt((p * (1 - p)) / n)
+  z  <- 1.645
+  lower <- max(0, p - z * se)
+  upper <- min(1, p + z * se)
+  c(lower, upper)
+}
+
+table_rings$CI_Lower_90 <- NA_real_
+table_rings$CI_Upper_90 <- NA_real_
+
+for (i in seq_len(nrow(table_rings))) {
+  p_i <- table_rings$Proportion_exact[i]
+  n_i <- table_rings$Estimated_Structures[i]
+  if (n_i > 0) {
+    ic <- calc_CI_90(p_i, n_i)
+    table_rings$CI_Lower_90[i] <- ic[1] * 100
+    table_rings$CI_Upper_90[i] <- ic[2] * 100
+  }
+}
+
+w <- rev(seq_len(nrow(table_rings)))
+B <- (100 * sum(w * table_rings$Proportion_exact) - 650) / 550
+
+wp     <- sum(w * table_rings$Proportion_exact)
+var_wp <- (sum((w^2) * table_rings$Proportion_exact) - wp^2) / total_structures
+se_B   <- (100 / 550) * sqrt(var_wp)
+z95    <- 1.96
+
+B_margin95 <- z95 * se_B
+B_low95    <- B - B_margin95
+B_high95   <- B + B_margin95
+
+table_output <- data.frame(
+  Ring                      = table_rings$Ring,
+  Estimated_Structures      = table_rings$Estimated_Structures,
+  Structure_Proportion_pct  = paste0(table_rings$Proportion, "%"),
+  Cumulative_Proportion_pct = paste0(table_rings$Cumulative_Proportion, "%")
+)
+
+table_output <- rbind(
+  table_output,
+  data.frame(
+    Ring = "Total",
+    Estimated_Structures = total_structures,
+    Structure_Proportion_pct = "100%",
+    Cumulative_Proportion_pct = paste0(sum(table_rings$Cumulative_Proportion), "%")
+  ),
+  data.frame(
+    Ring = "B value (95% CI)",
+    Estimated_Structures = NA,
+    Structure_Proportion_pct = paste0(sprintf("%.4f", B), " ± ", sprintf("%.4f", B_margin95)),
+    Cumulative_Proportion_pct = sprintf("[%.4f, %.4f]", B_low95, B_high95)
+  )
+)
+
+
+final_table <- table_rings
+final_table$CI_Lower_90 <- ifelse(is.na(final_table$CI_Lower_90), final_table$Proportion, final_table$CI_Lower_90)
+final_table$CI_Upper_90 <- ifelse(is.na(final_table$CI_Upper_90), final_table$Proportion, final_table$CI_Upper_90)
+
+soil_labels <- c(
+  "1. Very Low", "2. Low", "3. Medium-Low",
+  "4. Medium-High", "5. High", "6. Optimal"
+)
+
+soil_colors <- c(
+  "#5D3A00", "#A66C2D", "#D9B38C",
+  "#B5E28A", "#4CAF50", "#006837"
+)
+
+pts_withRing <- sf::st_join(struc_sf_xy, rings_sf["ring"], left = FALSE)
+
+v_pts <- terra::vect(pts_withRing)
+v_pts <- terra::project(v_pts, terra::crs(soils_r))
+
+soil_val <- terra::extract(soils_r, v_pts, ID = FALSE)
+
+xy_df <- data.frame(
+  ring  = pts_withRing$ring,
+  class = soil_val[[1]]
+)
+
+xy_df <- xy_df[!is.na(xy_df$ring) & !is.na(xy_df$class), , drop = FALSE]
+xy_df$ring <- factor(xy_df$ring, levels = sort(unique(rings_sf$ring)))
+
+cls_levels <- sort(unique(terra::values(soils_r, na.rm = TRUE)))
+cls_levels <- cls_levels[is.finite(cls_levels)]
+
+if (length(cls_levels) < 1) stop("No valid classes were detected in soils_r.")
+if (length(cls_levels) > length(soil_labels)) {
+  warning("The raster contains more than 6 classes; only the first 6 (sorted) will be used for labeling/colors.")
+  cls_levels <- cls_levels[seq_len(length(soil_labels))]
+}
+
+names(soil_labels) <- as.character(seq_along(soil_labels))
+names(soil_colors) <- as.character(seq_along(soil_colors))
+
+levels_map <- setNames(soil_labels[seq_len(length(cls_levels))], as.character(cls_levels))
+cols_map   <- setNames(soil_colors[seq_len(length(cls_levels))], as.character(cls_levels))
+
+xy_df$class <- factor(xy_df$class, levels = cls_levels, labels = unname(levels_map))
+
+tab_ring_class <- table(xy_df$ring, xy_df$class)
+
+tab_test <- tab_ring_class
+tab_test <- tab_test[rowSums(tab_test) > 0, , drop = FALSE]
+tab_test <- tab_test[, colSums(tab_test) > 0, drop = FALSE]
+
+chisq_res <- suppressWarnings(stats::chisq.test(tab_test, correct = FALSE))
+
+chi2  <- unname(chisq_res$statistic)
+n_tot <- sum(tab_test)
+rr <- nrow(tab_test)
+cc <- ncol(tab_test)
+cramers_v <- sqrt(chi2 / (n_tot * (min(rr - 1, cc - 1))))
+
+
+prop_by_class <- as.data.frame(colSums(tab_ring_class))
+colnames(prop_by_class) <- "n"
+prop_by_class$class <- factor(rownames(prop_by_class), levels = levels(xy_df$class))
+prop_by_class$prop  <- prop_by_class$n / sum(prop_by_class$n)
+
+col_props <- prop.table(tab_ring_class, margin = 2)
+
+df_ras <- as.data.frame(soils_r, xy = TRUE, na.rm = TRUE)
+colnames(df_ras) <- c("x", "y", "class")
+df_ras <- df_ras[is.finite(df_ras$class), , drop = FALSE]
+df_ras$class <- factor(df_ras$class, levels = cls_levels, labels = unname(levels_map))
+
+cols_map_labels <- setNames(soil_colors[seq_len(length(cls_levels))], unname(levels_map))
+prop_by_class$class <- factor(prop_by_class$class, levels = unname(levels_map))
+
+ring_summary_tbl <- table_output[table_output$Ring %in% as.character(seq_len(n_rings)), ]
+b_summary_tbl <- data.frame(
+  Statistic = c("B coefficient", "95% CI lower", "95% CI upper"),
+  Value = c(sprintf("%.4f", B), sprintf("%.4f", B_low95), sprintf("%.4f", B_high95)),
+  stringsAsFactors = FALSE
+)
+soil_summary_tbl <- data.frame(
+  Soil_class = as.character(prop_by_class$class),
+  N = prop_by_class$n,
+  Proportion_pct = round(prop_by_class$prop * 100, 1),
+  stringsAsFactors = FALSE
+)
+soil_test_tbl <- data.frame(
+  Statistic = c("Chi-square", "df", "p-value", "Cramer's V"),
+  Value = c(sprintf("%.3f", chi2), as.character(unname(chisq_res$parameter)[1]), ifelse(chisq_res$p.value < 0.001, "< 0.001", format(signif(chisq_res$p.value, 4), scientific = FALSE)), sprintf("%.3f", cramers_v)),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(ring_summary_tbl, caption = "Demographic centralization: ring-by-ring structure distribution")
+knitr::kable(b_summary_tbl, caption = "Demographic centralization: manuscript-statistics summary")
+knitr::kable(soil_summary_tbl, caption = "Soil classes: structure proportions")
+knitr::kable(soil_test_tbl, caption = "Soil classes by ring: manuscript-statistics summary")
+
+pA <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = survey_union, fill = "lightgray", color = "black", linetype = "dashed") +
+  ggplot2::geom_sf(data = rings_sf, ggplot2::aes(fill = count), color = "blue", alpha = 0.5) +
+  ggplot2::geom_sf(data = sites_poly_sf, fill = NA, color = "darkred", linewidth = 0.4) +
+  ggplot2::geom_point(ggplot2::aes(x = center_x, y = center_y), color = "green", size = 2) +
+  ggspatial::annotation_scale(location = "bl", width_hint = 0.3) +
+  ggspatial::annotation_north_arrow(location = "tl", which_north = "true",
+                                    style = ggspatial::north_arrow_fancy_orienteering()) +
+  ggplot2::scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Count") +
+  ggplot2::labs(
+    title    = "A. Structures by ring",
+    subtitle = paste0(
+      "B = ", sprintf("%.4f", B),
+      " ± ", sprintf("%.4f", B_margin95),
+      "  (95% CI: [", sprintf("%.4f", B_low95), ", ", sprintf("%.4f", B_high95), "])"
+    ),
+    x = "UTM East (m)",
+    y = "UTM North (m)"
+  ) +
+  ggplot2::theme_bw()
+
+pB <- ggplot2::ggplot(final_table, ggplot2::aes(x = Ring, y = Proportion)) +
+  ggplot2::geom_line(color = "black", linewidth = 1) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = pmax(CI_Lower_90, 0), ymax = CI_Upper_90),
+                       fill = "gray80", alpha = 0.5) +
+  ggplot2::labs(
+    title    = paste0("B. Distribution of structures — B = ", sprintf("%.4f", B)),
+    subtitle = "Analysis based on TAIRONA_STRUCTURES counts per ring",
+    x = "Ring",
+    y = "Percent (%)"
+  ) +
+  ggplot2::theme_bw() +
+  ggplot2::scale_y_continuous(breaks = seq(0, 100, by = 10), limits = c(0, 100)) +
+  ggplot2::scale_x_continuous(breaks = seq(1, n_rings, by = 1))
+
+pC <- ggplot2::ggplot() +
+  ggplot2::geom_raster(data = df_ras, ggplot2::aes(x = x, y = y, fill = class)) +
+  ggplot2::geom_sf(data = survey_union, fill = NA, color = "black", linetype = "dashed", linewidth = 0.4) +
+  ggplot2::geom_sf(data = rings_sf, fill = NA, color = "red", linewidth = 0.7) +
+  ggplot2::geom_sf(data = sites_poly_sf, fill = "black", color = "black", linewidth = 0.35) +
+  ggplot2::geom_point(ggplot2::aes(x = center_x, y = center_y), color = "green", size = 2) +
+  ggplot2::coord_sf(crs = sf::st_crs(target_crs), datum = NA) +
+  ggspatial::annotation_scale(location = "bl", width_hint = 0.30) +
+  ggspatial::annotation_north_arrow(location = "tl", which_north = "true",
+                                    style = ggspatial::north_arrow_fancy_orienteering()) +
+  ggplot2::scale_fill_manual(values = cols_map_labels, drop = FALSE, name = "Soil suitability") +
+  ggplot2::labs(
+    title    = "C. Soils (suitability classes) with rings and sites",
+    subtitle = paste0("Raster: ", basename(tif_soils)),
+    x = "UTM East (m)",
+    y = "UTM North (m)"
+  ) +
+  ggplot2::theme_bw()
+
+pD <- ggplot2::ggplot(prop_by_class, ggplot2::aes(x = class, y = prop, fill = class)) +
+  ggplot2::geom_col(color = "black", width = 0.22) +
+  ggplot2::geom_text(ggplot2::aes(label = scales::percent(prop, accuracy = 0.1)),
+                     vjust = -0.35, size = 3.6) +
+  ggplot2::scale_y_continuous(labels = scales::percent,
+                              limits = c(0, max(prop_by_class$prop) * 1.15)) +
+  ggplot2::scale_fill_manual(values = cols_map_labels, drop = FALSE) +
+  ggplot2::guides(fill = "none") +
+  ggplot2::labs(
+    title = "D. Proportion of structures by soil class (raster)",
+    x     = "Soil suitability class",
+    y     = "Proportion"
+  ) +
+  ggplot2::theme_bw(base_size = 12)
+
+print((pA | pB) / (pC | pD))
+```
+
+## 6. Least-cost paths and space syntax
+```{r section_6_least_cost_paths_and_space_syntax}
+dem_tif <- pick_file(
+  c(
+    "DEM_POLYGON_52KM\\.(tif|tiff)$",
+    "DEM.*52KM.*\\.(tif|tiff)$",
+    "DEM.*\\.(tif|tiff)$"
+  ),
+  tifs
+)
+
+stopifnot(!is.na(dem_tif), file.exists(dem_tif))
+stopifnot(!is.na(shp_localcom), file.exists(shp_localcom))
+
+centroids_path <- shp_localcom
+dem_path       <- dem_tif
+
+crs_utm18n <- sf::st_crs(target_crs)
+
+dem_raster <- raster::raster(dem_path)
+
+if (is.na(raster::crs(dem_raster))) {
+  raster::crs(dem_raster) <- crs_utm18n$wkt
+} else {
+  if (!raster::compareCRS(dem_raster, crs_utm18n$wkt)) {
+    dem_raster <- raster::projectRaster(dem_raster, crs = crs_utm18n$wkt, method = "bilinear")
+  }
+}
+
+centroids <- sf::st_read(centroids_path, quiet = TRUE)
+
+if (is.na(sf::st_crs(centroids))) sf::st_crs(centroids) <- crs_utm18n
+if (!all(sf::st_geometry_type(centroids) == "POINT")) centroids <- sf::st_cast(centroids, "POINT")
+
+centroids <- sf::st_transform(centroids, crs = crs_utm18n)
+centroids <- sf::st_zm(centroids, drop = TRUE, what = "ZM")
+
+centroids <- centroids[sf::st_within(centroids, survey_union, sparse = FALSE)[, 1], , drop = FALSE]
+stopifnot(nrow(centroids) >= 2)
+
+coords_full <- sf::st_coordinates(centroids)[, 1:2, drop = FALSE]
+
+coords_sp      <- sp::SpatialPoints(coords_full, proj4string = sp::CRS(raster::projection(dem_raster)))
+origins_sp_net <- coords_sp
+
+dest_spdf_all <- sp::SpatialPointsDataFrame(
+  coords      = coords_sp,
+  data        = data.frame(id = seq_len(nrow(coords_full))),
+  proj4string = sp::CRS(raster::projection(dem_raster))
+)
+
+# 1. Isocronas acumuladas de todas las comunidades (Todos contra Todos)
+result3 <- movecost::movecost(
+  dtm           = dem_raster,
+  origin        = dest_spdf_all,
+  move          = 16,
+  funct         = "t",
+  time          = "m",
+  breaks        = 40,
+  N             = 2,
+  irregular.dtm = TRUE,
+  oneplot       = TRUE
+)
+print(result3)
+
+# 2. Redes de rutas (allpairs)
+result4 <- movecost::movenetw(
+  dtm           = dem_raster,
+  origin        = origins_sp_net,
+  funct         = "t",
+  netw.type     = "allpairs",
+  irregular.dtm = TRUE
+)
+print(result4)
+
+# 3. Redes de rutas (neigh)
+result5 <- movecost::movenetw(
+  dtm           = dem_raster,
+  origin        = origins_sp_net,
+  funct         = "t",
+  netw.type     = "neigh",
+  irregular.dtm = TRUE
+)
+print(result5)
+
+# 4. Sintaxis Espacial
+stopifnot(exists("sites_poly_sf"), inherits(sites_poly_sf, "sf"))
+stopifnot(exists("survey_union"), inherits(survey_union, "sfc") || inherits(survey_union, "sf"))
+
+sites_sf      <- sf::st_transform(sites_poly_sf, sf::st_crs(target_crs)) |> sf::st_make_valid()
+study_area_sf <- sf::st_transform(survey_union,  sf::st_crs(target_crs)) |> sf::st_make_valid()
+
+sites_centroids <- sf::st_centroid(sites_sf)
+
+id_field_sites <- if ("ID" %in% names(sites_sf)) {
+  "ID"
+} else if ("id" %in% names(sites_sf)) {
+  "id"
+} else {
+  sites_sf$ID <- seq_len(nrow(sites_sf))
+  "ID"
+}
+sites_sf[[id_field_sites]] <- as.character(sites_sf[[id_field_sites]])
+
+sites_sp <- methods::as(sites_centroids, "Spatial")
+row.names(sites_sp) <- sites_sf[[id_field_sites]]
+
+site_network <- movecost::movenetw(
+  dtm           = dem_raster,
+  origin        = sites_sp,
+  funct         = "t",
+  netw.type     = "allpairs",
+  irregular.dtm = TRUE
+)
+
+cost_matrix <- site_network$cost.matrix.min
+diag(cost_matrix) <- 0
+cost_matrix <- pmin(cost_matrix, t(cost_matrix), na.rm = TRUE)
+cost_matrix[!is.finite(cost_matrix)] <- Inf
+
+g_full <- igraph::graph_from_adjacency_matrix(cost_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+igraph::V(g_full)$name <- sites_sf[[id_field_sites]]
+g_mst <- igraph::mst(g_full, weights = igraph::E(g_full)$weight)
+
+integration <- igraph::closeness(g_full, weights = igraph::E(g_full)$weight, normalized = TRUE)
+choice      <- igraph::betweenness(g_full, weights = igraph::E(g_full)$weight, directed = FALSE, normalized = TRUE)
+
+sites_sf$integration   <- as.numeric(integration)
+sites_sf$choice        <- as.numeric(choice)
+sites_sf$integration_z <- as.numeric(scale(sites_sf$integration))
+sites_sf$choice_z      <- as.numeric(scale(sites_sf$choice))
+
+if (!"Size_HA" %in% names(sites_sf)) {
+  sites_sf$Size_HA <- as.numeric(sf::st_area(sites_sf)) / 10000
+}
+
+sites_sf$size_group <- cut(
+  sites_sf$Size_HA,
+  breaks = c(-Inf, 1, 5, Inf),
+  labels = c("Small", "Medium", "Large"),
+  right  = TRUE
+)
+
+size_fac <- droplevels(sites_sf$size_group)
+
+valid_rows_int <- is.finite(sites_sf$integration) & !is.na(size_fac)
+valid_rows_cho <- is.finite(sites_sf$choice)      & !is.na(size_fac)
+
+grp_counts <- table(size_fac)
+if (sum(grp_counts > 0) < 2) {
+  warning("Not enough size groups with data to run Kruskal–Wallis/Dunn. Skipping non-parametric tests.")
+} else {
+  kw_int <- kruskal.test(integration ~ size_fac, data = sites_sf[valid_rows_int, ])
+  kw_cho <- kruskal.test(choice      ~ size_fac, data = sites_sf[valid_rows_cho, ])
+  
+  if (!requireNamespace("dunn.test", quietly = TRUE)) {
+    stop("Package 'dunn.test' is required for Dunn post hoc with Bonferroni. Please install it.")
+  }
+  
+  dunn_int <- dunn.test::dunn.test(
+    x = sites_sf$integration[valid_rows_int],
+    g = size_fac[valid_rows_int],
+    method = "bonferroni",
+    kw = FALSE,
+    list = TRUE
+  )
+  
+  dunn_cho <- dunn.test::dunn.test(
+    x = sites_sf$choice[valid_rows_cho],
+    g = size_fac[valid_rows_cho],
+    method = "bonferroni",
+    kw = FALSE,
+    list = TRUE
+  )
+  
+  tidy_kw <- function(kw, varname) {
+    data.frame(
+      Variable = varname,
+      H_stat   = round(as.numeric(kw$statistic), 3),
+      df       = as.integer(kw$parameter),
+      p_value  = signif(kw$p.value, 4),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  tidy_dunn <- function(d, varname) {
+    data.frame(
+      Variable     = varname,
+      Comparison   = gsub(" - ", " vs ", d$comparisons, fixed = TRUE),
+      Z_value      = round(d$Z, 3),
+      p_raw        = signif(d$P, 4),
+      p_bonferroni = signif(d$P.adjusted, 4),
+      Significant  = ifelse(d$P.adjusted < 0.05, "Yes", "No"),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  tab_kw <- rbind(
+    tidy_kw(kw_int, "Supra-local accessibility (integration)"),
+    tidy_kw(kw_cho, "Path-through frequency (choice)")
+  )
+  
+  tab_dunn <- rbind(
+    tidy_dunn(dunn_int, "Supra-local accessibility (integration)"),
+    tidy_dunn(dunn_cho, "Path-through frequency (choice)")
+  )
+  
+  print(knitr::kable(tab_kw,  caption = "Space-syntax: Kruskal–Wallis omnibus tests by site size"))
+  print(knitr::kable(tab_dunn, caption = "Space-syntax: Dunn post-hoc pairwise comparisons (Bonferroni)"))
+}
+
+edges_df <- igraph::as_data_frame(g_mst, what = "edges")
+edges_df$from <- as.character(edges_df$from)
+edges_df$to   <- as.character(edges_df$to)
+
+coords_mat <- sf::st_coordinates(sites_centroids)
+coord_tbl <- data.frame(
+  ID = sites_sf[[id_field_sites]],
+  X  = as.numeric(coords_mat[, 1]),
+  Y  = as.numeric(coords_mat[, 2]),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::distinct(ID, .keep_all = TRUE)
+
+edges_xy <- dplyr::left_join(edges_df, coord_tbl, by = c("from" = "ID")) |>
+  dplyr::rename(X1 = X, Y1 = Y) |>
+  dplyr::left_join(coord_tbl, by = c("to" = "ID")) |>
+  dplyr::rename(X2 = X, Y2 = Y)
+
+edges_xy_valid <- dplyr::filter(edges_xy, is.finite(X1), is.finite(Y1), is.finite(X2), is.finite(Y2))
+
+line_geoms <- lapply(seq_len(nrow(edges_xy_valid)), function(i) {
+  m <- matrix(c(edges_xy_valid$X1[i], edges_xy_valid$Y1[i],
+                edges_xy_valid$X2[i], edges_xy_valid$Y2[i]), ncol = 2, byrow = TRUE)
+  sf::st_linestring(m)
+})
+
+mst_sf <- sf::st_sf(
+  edges_xy_valid,
+  geometry = sf::st_sfc(line_geoms, crs = sf::st_crs(sites_sf))
+)
+
+study_sf <- sf::st_transform(study_area_sf, sf::st_crs(sites_sf))
+if (!identical(sf::st_crs(mst_sf), sf::st_crs(study_sf))) {
+  mst_sf <- sf::st_transform(mst_sf, sf::st_crs(study_sf))
+}
+
+pal_z <- ggplot2::scale_fill_gradient2(
+  low = "#6B5B95", mid = "#FFFFFF", high = "#FF6F61",
+  midpoint = 0, name = "Z-score"
+)
+
+# Figuras 8 y 9
+p_int <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = study_sf, fill = "grey92", color = "black", linewidth = 0.4) +
+  ggplot2::geom_sf(data = mst_sf,   color = "darkblue", linewidth = 0.9) +
+  ggplot2::geom_sf(
+    data = sites_sf,
+    ggplot2::aes(fill = integration_z),
+    color = "black", linewidth = 0.15, alpha = 0.95
+  ) +
+  pal_z +
+  ggplot2::labs(
+    title = "Supra-local accessibility (integration) Z-scores with MST",
+    subtitle = "Site polygons colored by Z-score; study area in grey"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+p_cho <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = study_sf, fill = "grey92", color = "black", linewidth = 0.4) +
+  ggplot2::geom_sf(data = mst_sf,   color = "darkblue", linewidth = 0.9) +
+  ggplot2::geom_sf(
+    data = sites_sf,
+    ggplot2::aes(fill = choice_z),
+    color = "black", linewidth = 0.15, alpha = 0.95
+  ) +
+  pal_z +
+  ggplot2::labs(
+    title = "Path-through frequency (choice) Z-scores with MST",
+    subtitle = "Site polygons colored by Z-score; study area in grey"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+print(p_int)
+print(p_cho)
+```
+
+## 7. Regression models
+```{r section_7_regression_models}
+rds_files <- list.files(
+  folder,
+  pattern = "regression_data\\.rds$",
+  full.names = TRUE,
+  recursive = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(rds_files) == 0) stop("RDS file not found (pattern: regression_data.rds).")
+
+rds_path <- rds_files[1]
+my_data <- readRDS(rds_path)
+
+stars <- function(p) {
+  if (is.na(p)) "" else if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else if (p < 0.1) "." else ""
+}
+
+to_num <- function(x) {
+  if (is.numeric(x)) {
+    x <- as.numeric(x)
+    x[x == -999] <- NA_real_
+    return(x)
+  }
+  x <- trimws(as.character(x))
+  x[x %in% c("NA","Na","na",""," ","NULL","Null","null","-999")] <- NA_character_
+  x <- gsub("([0-9]),([0-9])", "\\1.\\2", x)
+  x <- gsub(",", "", x)
+  out <- suppressWarnings(as.numeric(x))
+  out[out == -999] <- NA_real_
+  out
+}
+
+pick_col <- function(df_names, patterns) {
+  for (pt in patterns) {
+    hit <- grep(pt, df_names, ignore.case = TRUE, value = TRUE)
+    if (length(hit) >= 1) return(hit[1])
+  }
+  NA_character_
+}
+
+safe_exp <- function(x) suppressWarnings(exp(x))
+
+nb_summary_spss <- function(m) {
+  ll_full <- tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_)
+  m0 <- tryCatch(update(m, . ~ 1), error = function(e) NULL)
+  ll_null <- tryCatch(as.numeric(logLik(m0)), error = function(e) NA_real_)
+  mcfadden <- if (is.finite(ll_full) && is.finite(ll_null)) 1 - (ll_full / ll_null) else NA_real_
+  data.frame(
+    N = tryCatch(stats::nobs(m), error = function(e) NA_integer_),
+    Theta = tryCatch(if(inherits(m, "negbin")) as.numeric(m$theta) else NA_real_, error = function(e) NA_real_),
+    AIC = tryCatch(AIC(m), error = function(e) NA_real_),
+    BIC = tryCatch(BIC(m), error = function(e) NA_real_),
+    logLik = ll_full,
+    McFadden_R2 = mcfadden,
+    stringsAsFactors = FALSE
+  )
+}
+
+confint_wald <- function(m, level = 0.95) {
+  ci <- tryCatch(stats::confint.default(m, level = level), error = function(e) NULL)
+  if (is.null(ci)) {
+    cf <- coef(m)
+    se <- sqrt(diag(vcov(m)))
+    z <- stats::qnorm(1 - (1 - level) / 2)
+    ci <- cbind(cf - z * se, cf + z * se)
+    rownames(ci) <- names(cf)
+    colnames(ci) <- c("2.5 %", "97.5 %")
+  }
+  ci
+}
+
+coef_table_gen <- function(m, outcome, model_label, predictor_label) {
+  sm <- as.matrix(summary(m)$coefficients)
+  ci <- confint_wald(m, level = 0.95)
+  
+  common <- intersect(rownames(sm), rownames(ci))
+  sm <- sm[common, , drop = FALSE]
+  ci <- ci[common, , drop = FALSE]
+  
+  df <- data.frame(
+    Outcome = outcome,
+    Model = model_label,
+    Term = rownames(sm),
+    Estimate = as.numeric(sm[, 1]),
+    SE = as.numeric(sm[, 2]),
+    z_val = as.numeric(sm[, 3]),
+    p = as.numeric(sm[, 4]),
+    CI_low = as.numeric(ci[, 1]),
+    CI_high = as.numeric(ci[, 2]),
+    Exp_Est = safe_exp(as.numeric(sm[, 1])),
+    Exp_CI_low = safe_exp(as.numeric(ci[, 1])),
+    Exp_CI_high = safe_exp(as.numeric(ci[, 2])),
+    Sig = vapply(as.numeric(sm[, 4]), stars, character(1)),
+    stringsAsFactors = FALSE
+  )
+  df$Predictor <- predictor_label
+  df
+}
+
+get_col_value <- function(df, row_i, candidates) {
+  nm <- intersect(candidates, names(df))
+  if (!length(nm)) return(NA_real_)
+  val <- df[[nm[1]]][row_i]
+  suppressWarnings(as.numeric(val))
+}
+
+anova_lr_row <- function(m, outcome, model_label) {
+  m0 <- tryCatch(update(m, . ~ 1), error = function(e) NULL)
+  test_type <- if (inherits(m, "glm") && m$family$family == "quasibinomial") "F" else "Chisq"
+  a <- tryCatch(stats::anova(m0, m, test = test_type), error = function(e) NULL)
+  
+  if (is.null(a)) {
+    return(data.frame(Outcome = outcome, Model = model_label, Df = NA_real_, LR = NA_real_, p = NA_real_, Sig = "", stringsAsFactors = FALSE))
+  }
+  a2 <- as.data.frame(a)
+  if (nrow(a2) < 2) {
+    return(data.frame(Outcome = outcome, Model = model_label, Df = NA_real_, LR = NA_real_, p = NA_real_, Sig = "", stringsAsFactors = FALSE))
+  }
+  
+  df_val <- get_col_value(a2, 2, c("Df", "df"))
+  lr_val <- get_col_value(a2, 2, c("LR stat.", "LR stat", "Chisq", "Deviance", "F"))
+  p_val <- get_col_value(a2, 2, c("Pr(>Chi)", "Pr(Chi)", "Pr(>Chisq)", "Pr(>F)"))
+  
+  data.frame(
+    Outcome = outcome,
+    Model = model_label,
+    Df = df_val,
+    LR = lr_val,
+    p = p_val,
+    Sig = stars(p_val),
+    stringsAsFactors = FALSE
+  )
+}
+
+is_count_like <- function(x) {
+  x <- x[is.finite(x)]
+  if (!length(x)) return(FALSE)
+  all(x >= 0) && all(abs(x - round(x)) < 1e-8)
+}
+
+dat_xl <- as.data.frame(my_data[[1]])
+
+dat_xl[] <- lapply(dat_xl, function(x) {
+  x[x %in% c("NA","Na","na",""," ","NULL","Null","null","-999",-999)] <- NA
+  return(x)
+})
+
+names(dat_xl) <- make.names(names(dat_xl), unique = TRUE)
+
+col_terr <- pick_col(names(dat_xl), c("^Terraces$"))
+col_diam <- pick_col(names(dat_xl), c("^Diamater_terraces$", "^Diameter.*terraces$", "Diam.*terraces$"))
+col_deco <- pick_col(names(dat_xl), c("^Decorated$", "^Decorated_Count$", "^Decorated_sherds$", "^DecoratedSherds$"))
+col_cook <- pick_col(names(dat_xl), c("^Cooking$"))
+col_serv <- pick_col(names(dat_xl), c("^Serving$"))
+col_stor <- pick_col(names(dat_xl), c("^Storage$"))
+col_simp <- pick_col(names(dat_xl), c("^Simpson$", "^Simpson_Index$", "^Diversity$"))
+
+if (anyNA(c(col_terr, col_diam, col_deco, col_cook, col_serv, col_stor))) {
+  stop("One or more required columns were not found in the Excel sheet.")
+}
+
+dat <- data.frame(
+  Terraces = to_num(dat_xl[[col_terr]]),
+  Diamater_terraces = to_num(dat_xl[[col_diam]]),
+  Decorated = to_num(dat_xl[[col_deco]]),
+  Cooking = to_num(dat_xl[[col_cook]]),
+  Serving = to_num(dat_xl[[col_serv]]),
+  Storage = to_num(dat_xl[[col_stor]])
+)
+
+if (!is.na(col_simp)) {
+  dat$Simpson <- to_num(dat_xl[[col_simp]])
+} else {
+  dat$Simpson <- NA
+}
+
+bootstrap_mean_ci <- function(x, R = 10000, conf = 0.95, seed = 2025236) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 3) stop("Not enough valid observations for bootstrap (n < 3).")
+  set.seed(seed)
+  boot_means <- replicate(R, mean(sample(x, size = n, replace = TRUE)))
+  alpha <- 1 - conf
+  ci <- as.numeric(stats::quantile(boot_means, probs = c(alpha/2, 1 - alpha/2), type = 7, names = FALSE))
+  list(mean = mean(x), n = n, ci_low = ci[1], ci_high = ci[2])
+}
+
+format_bootstrap_line <- function(label, unit, res, digits = 1) {
+  sprintf(
+    "%s average %.1f %s in diameter (n = %s; 95%% CI = %.1f to %.1f %s).",
+    label,
+    round(res$mean, digits),
+    unit,
+    format(res$n, big.mark = ","),
+    round(res$ci_low, digits),
+    round(res$ci_high, digits),
+    unit
+  )
+}
+
+dat_xl2 <- as.data.frame(my_data[[2]])
+
+dat_xl2[] <- lapply(dat_xl2, function(x) {
+  x[x %in% c("NA","Na","na",""," ","NULL","Null","null","-999",-999)] <- NA
+  return(x)
+})
+
+names(dat_xl2) <- make.names(names(dat_xl2), unique = TRUE)
+
+col_rim2  <- pick_col(names(dat_xl2), c("^Rim_cm$", "^Rim\\.cm$", "Rim"))
+col_diam2 <- pick_col(names(dat_xl2), c("^Daiameter_Terraces$", "^Diameter_Terraces$", "Diam.*Terraces"))
+
+if (anyNA(c(col_rim2, col_diam2))) {
+  rim_bootstrap_report <- "Ceramic rims data not found."
+  terrace_bootstrap_report <- "Terrace diameter data not found."
+} else {
+  rim_cm <- to_num(dat_xl2[[col_rim2]])
+  terr_m <- to_num(dat_xl2[[col_diam2]])
+  
+  rim_res  <- bootstrap_mean_ci(rim_cm, R = 10000, conf = 0.95, seed = 2025236)
+  terr_res <- bootstrap_mean_ci(terr_m, R = 10000, conf = 0.95, seed = 2025236)
+  
+  rim_bootstrap_report  <- format_bootstrap_line("Ceramic rims", "cm", rim_res, digits = 1)
+  terrace_bootstrap_report <- format_bootstrap_line("Residential terraces", "m", terr_res, digits = 1)
+}
+
+outcomes <- c("Cooking", "Serving", "Storage", "Decorated")
+
+all_coef <- list()
+all_fit <- list()
+all_lr <- list()
+
+for (y in outcomes) {
+  d0 <- dat[, c(y, "Terraces", "Diamater_terraces")]
+
+  if (!is_count_like(d0[[y]])) next
+
+  d_terr <- d0[is.finite(d0[[y]]) & is.finite(d0$Terraces), c(y, "Terraces"), drop = FALSE]
+  if (nrow(d_terr) >= 10) {
+    f1 <- stats::as.formula(paste0(y, " ~ Terraces"))
+    m1 <- MASS::glm.nb(f1, data = d_terr)
+    all_coef[[paste0(y, "_terr")]] <- coef_table_gen(m1, y, "NB_Terraces_only", "Terraces")
+  }
+
+  d_diam <- d0[is.finite(d0[[y]]) & is.finite(d0$Diamater_terraces), c(y, "Diamater_terraces"), drop = FALSE]
+  if (nrow(d_diam) >= 10) {
+    f2 <- stats::as.formula(paste0(y, " ~ Diamater_terraces"))
+    m2 <- MASS::glm.nb(f2, data = d_diam)
+    all_coef[[paste0(y, "_diam")]] <- coef_table_gen(m2, y, "NB_Diamater_only", "Diamater_terraces")
+  }
+}
+
+if ("Simpson" %in% names(dat) && any(!is.na(dat$Simpson))) {
+  y <- "Simpson"
+
+  d0 <- dat[, c(y, "Terraces", "Diamater_terraces")]
+
+  d_terr <- d0[is.finite(d0[[y]]) & is.finite(d0$Terraces), c(y, "Terraces"), drop = FALSE]
+  if (nrow(d_terr) >= 10) {
+    f1 <- stats::as.formula(paste0(y, " ~ Terraces"))
+    m1 <- stats::glm(f1, data = d_terr, family = quasibinomial(link = "logit"))
+    all_coef[[paste0(y, "_terr")]] <- coef_table_gen(m1, y, "GLM_QB_Terraces_only", "Terraces")
+  }
+
+  d_diam <- d0[is.finite(d0[[y]]) & is.finite(d0$Diamater_terraces), c(y, "Diamater_terraces"), drop = FALSE]
+  if (nrow(d_diam) >= 10) {
+    f2 <- stats::as.formula(paste0(y, " ~ Diamater_terraces"))
+    m2 <- stats::glm(f2, data = d_diam, family = quasibinomial(link = "logit"))
+    all_coef[[paste0(y, "_diam")]] <- coef_table_gen(m2, y, "GLM_QB_Diameter_only", "Diamater_terraces")
+  }
+}
+
+coef_df <- do.call(rbind, all_coef)
+regression_manuscript_tbl <- coef_df[coef_df$Term %in% c("Terraces", "Diamater_terraces"), c("Outcome","Predictor","Estimate","p","Exp_Est","Exp_CI_low","Exp_CI_high")]
+regression_manuscript_tbl$Estimate <- round(regression_manuscript_tbl$Estimate, 6)
+regression_manuscript_tbl$p <- ifelse(regression_manuscript_tbl$p < 0.001, "< 0.001", format(round(regression_manuscript_tbl$p, 6), nsmall = 6))
+regression_manuscript_tbl$Exp_Est <- round(regression_manuscript_tbl$Exp_Est, 6)
+regression_manuscript_tbl$Exp_CI_low <- round(regression_manuscript_tbl$Exp_CI_low, 6)
+regression_manuscript_tbl$Exp_CI_high <- round(regression_manuscript_tbl$Exp_CI_high, 6)
+
+cer_rds_reg <- file.path(folder, "TAIRONA_CERAMICS.rds")
+shp_sites_poly_reg <- pick_file(c("TAIRONA_POLYGONS_SITES\\.shp$"), shps)
+shp_structures_reg <- pick_file(c("TAIRONA_STRUCTURES\\.shp$"), shps)
+
+if (file.exists(cer_rds_reg) && !is.na(shp_sites_poly_reg) && !is.na(shp_structures_reg)) {
+  sites_reg_sf <- sf::st_read(shp_sites_poly_reg, quiet = TRUE) |>
+    sf::st_transform(target_crs) |>
+    sf::st_make_valid()
+  if (!"site_uid" %in% names(sites_reg_sf)) sites_reg_sf$site_uid <- seq_len(nrow(sites_reg_sf))
+
+  structures_reg_sf <- sf::st_read(shp_structures_reg, quiet = TRUE) |>
+    sf::st_transform(target_crs)
+  
+  cer_reg_sf <- readRDS(cer_rds_reg) |>
+    sf::st_transform(target_crs)
+
+  if ("TERRACES" %in% names(sites_reg_sf)) sites_reg_sf$TERRACES[sites_reg_sf$TERRACES == -999] <- NA
+  if ("Diam_Terra" %in% names(structures_reg_sf)) structures_reg_sf$Diam_Terra[structures_reg_sf$Diam_Terra == -999] <- NA
+
+  struc_reg_join <- sf::st_join(structures_reg_sf, sites_reg_sf["site_uid"]) |> sf::st_drop_geometry()
+  terr_reg_stats <- struc_reg_join |>
+    dplyr::group_by(site_uid) |>
+    dplyr::summarise(avg_terr_diam = mean(as.numeric(Diam_Terra), na.rm = TRUE), .groups = "drop")
+
+  sites_reg_buffered <- sf::st_buffer(sites_reg_sf, dist = 30)
+  cer_reg_join <- sf::st_join(cer_reg_sf, sites_reg_buffered["site_uid"], left = FALSE) |> sf::st_drop_geometry()
+  func_reg_field <- if ("Function" %in% names(cer_reg_join)) "Function" else "Ceramic_ty"
+  diam_reg_field <- if ("Rim_cm" %in% names(cer_reg_join)) "Rim_cm" else NA_character_
+
+  cer_reg_df <- cer_reg_join |>
+    dplyr::mutate(
+      Function = as.character(.data[[func_reg_field]]),
+      Vessel_Diam = if (!is.na(diam_reg_field)) suppressWarnings(as.numeric(as.character(.data[[diam_reg_field]]))) else NA_real_
+    ) |>
+    dplyr::mutate(
+      Function = dplyr::na_if(Function, "-999"),
+      Function = dplyr::na_if(Function, "NA"),
+      Vessel_Diam = ifelse(Vessel_Diam == -999, NA_real_, Vessel_Diam)
+    ) |>
+    dplyr::filter(!is.na(site_uid), !is.na(Function))
+
+  cer_reg_stats <- cer_reg_df |>
+    dplyr::group_by(site_uid) |>
+    dplyr::summarise(avg_vessel_diam = mean(Vessel_Diam, na.rm = TRUE), .groups = "drop")
+
+  rim_assoc_df <- sites_reg_sf |>
+    sf::st_drop_geometry() |>
+    tibble::as_tibble() |>
+    dplyr::select(site_uid, TERRACES) |>
+    dplyr::left_join(terr_reg_stats, by = "site_uid") |>
+    dplyr::left_join(cer_reg_stats, by = "site_uid") |>
+    dplyr::mutate(
+      TERRACES = as.numeric(TERRACES),
+      avg_terr_diam = as.numeric(avg_terr_diam),
+      avg_vessel_diam = as.numeric(avg_vessel_diam)
+    )
+
+  rim_fit_terr <- stats::lm(avg_vessel_diam ~ TERRACES, data = rim_assoc_df[is.finite(rim_assoc_df$avg_vessel_diam) & is.finite(rim_assoc_df$TERRACES), ])
+  rim_fit_diam <- stats::lm(avg_vessel_diam ~ avg_terr_diam, data = rim_assoc_df[is.finite(rim_assoc_df$avg_vessel_diam) & is.finite(rim_assoc_df$avg_terr_diam), ])
+
+  rim_association_tbl <- data.frame(
+    Outcome = "Average ceramic rim diameter",
+    Predictor = c("Terraces", "Mean terrace diameter"),
+    Estimate = c(unname(coef(summary(rim_fit_terr))[2,1]), unname(coef(summary(rim_fit_diam))[2,1])),
+    p = c(unname(coef(summary(rim_fit_terr))[2,4]), unname(coef(summary(rim_fit_diam))[2,4])),
+    stringsAsFactors = FALSE
+  )
+  rim_association_tbl$Estimate <- round(rim_association_tbl$Estimate, 6)
+  rim_association_tbl$p <- ifelse(rim_association_tbl$p < 0.001, "< 0.001", format(round(rim_association_tbl$p, 6), nsmall = 6))
+} else {
+  rim_association_tbl <- data.frame(Outcome = character(), Predictor = character(), Estimate = numeric(), p = character(), stringsAsFactors = FALSE)
+}
+
+bootstrap_tbl <- data.frame(
+  Variable = c("Residential terraces", "Ceramic rims"),
+  Mean = c(round(terr_res$mean, 1), round(rim_res$mean, 1)),
+  N = c(terr_res$n, rim_res$n),
+  CI_low = c(round(terr_res$ci_low, 1), round(rim_res$ci_low, 1)),
+  CI_high = c(round(terr_res$ci_high, 1), round(rim_res$ci_high, 1)),
+  Unit = c("m", "cm"),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(regression_manuscript_tbl, caption = "Regression models: manuscript-statistics summary")
+knitr::kable(bootstrap_tbl, caption = "Bootstrap diameter estimates: manuscript-statistics summary")
+knitr::kable(rim_association_tbl, caption = "Rim diameter associations: manuscript-statistics summary")
+```
+
+## 8. Network analysis
+```{r section_8_network_analysis}
+target_crs <- 32618
+
+pick_existing_col <- function(df_names, candidates, regex_patterns = NULL, required = FALSE, label = "field") {
+  hits <- intersect(candidates, df_names)
+  if (length(hits) >= 1) return(hits[1])
+  if (!is.null(regex_patterns)) {
+    for (pt in regex_patterns) {
+      hit <- grep(pt, df_names, ignore.case = TRUE, value = TRUE)
+      if (length(hit) >= 1) return(hit[1])
+    }
+  }
+  if (required) {
+    stop(paste0("Required ", label, " not found. Available fields are: ", paste(df_names, collapse = ", ")))
+  }
+  NA_character_
+}
+
+norm_minmax <- function(x) {
+  x <- as.numeric(x)
+  if (length(x) == 0) return(numeric(0))
+  if (all(is.na(x))) return(rep(0, length(x)))
+  if (max(x, na.rm = TRUE) == min(x, na.rm = TRUE)) return(rep(0, length(x)))
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+stars <- function(p) {
+  if (is.na(p)) "" else if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else if (p < 0.1) "." else ""
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("< 0.001")
+  sprintf("%.3f", p)
+}
+
+safe_shapiro <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(NA_real_)
+  if (stats::sd(x) == 0) return(NA_real_)
+  tryCatch(stats::shapiro.test(x)$p.value, error = function(e) NA_real_)
+}
+
+safe_levene <- function(df, y, g) {
+  f <- stats::as.formula(paste0(y, " ~ ", g))
+  out <- tryCatch(car::leveneTest(f, data = df), error = function(e) NULL)
+  if (is.null(out)) return(NA_real_)
+  as.numeric(out$`Pr(>F)`[1])
+}
+
+standardize_size_group <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.numeric(x)) {
+    return(
+      factor(
+        cut(
+          x,
+          breaks = c(-Inf, 0.5, 1, Inf),
+          labels = c("Small sites", "Medium sites", "Large sites"),
+          right = TRUE
+        ),
+        levels = c("Small sites", "Medium sites", "Large sites")
+      )
+    )
+  }
+  x_chr <- trimws(tolower(as.character(x)))
+  out <- dplyr::case_when(
+    grepl("^small$|^small site[s]?$|^small settlement[s]?$|^peque", x_chr) ~ "Small sites",
+    grepl("^medium$|^medium site[s]?$|^medium settlement[s]?$|^med", x_chr) ~ "Medium sites",
+    grepl("^large$|^large site[s]?$|^large settlement[s]?$|^big$|^grand|^grande", x_chr) ~ "Large sites",
+    x_chr %in% c("1", "small", "s") ~ "Small sites",
+    x_chr %in% c("2", "medium", "m") ~ "Medium sites",
+    x_chr %in% c("3", "large", "l") ~ "Large sites",
+    TRUE ~ NA_character_
+  )
+  factor(out, levels = c("Small sites", "Medium sites", "Large sites"))
+}
+
+desc_table <- function(df, y) {
+  df |>
+    dplyr::select(size_group, dplyr::all_of(y)) |>
+    dplyr::filter(!is.na(size_group), is.finite(.data[[y]])) |>
+    dplyr::group_by(size_group) |>
+    dplyr::summarise(
+      metric = y,
+      n = dplyr::n(),
+      mean = mean(.data[[y]], na.rm = TRUE),
+      sd = stats::sd(.data[[y]], na.rm = TRUE),
+      median = stats::median(.data[[y]], na.rm = TRUE),
+      iqr = stats::IQR(.data[[y]], na.rm = TRUE),
+      min = min(.data[[y]], na.rm = TRUE),
+      max = max(.data[[y]], na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+run_tests_one_metric <- function(df, y) {
+  dd <- df |>
+    dplyr::select(size_group, dplyr::all_of(y)) |>
+    dplyr::filter(!is.na(size_group), is.finite(.data[[y]])) |>
+    dplyr::mutate(size_group = droplevels(size_group))
+  k <- dplyr::n_distinct(dd$size_group)
+  if (k < 2) {
+    return(list(
+      assumptions = tibble::tibble(metric = y, group = NA_character_, n = NA_integer_, shapiro_p = NA_real_, levene_p = NA_real_),
+      omnibus = tibble::tibble(metric = y, test = NA_character_, statistic = NA_real_, df = NA_character_, p_value = NA_real_, sig = NA_character_),
+      posthoc = tibble::tibble(metric = y, contrast = NA_character_, p_adjusted = NA_real_, sig = NA_character_, method = NA_character_)
+    ))
+  }
+  shapiro_tbl <- dd |>
+    dplyr::group_by(size_group) |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      shapiro_p = safe_shapiro(.data[[y]]),
+      .groups = "drop"
+    )
+  lev_p <- safe_levene(dd, y = y, g = "size_group")
+  assumptions <- shapiro_tbl |>
+    dplyr::mutate(
+      metric = y,
+      group = as.character(size_group),
+      levene_p = lev_p
+    ) |>
+    dplyr::select(metric, group, n, shapiro_p, levene_p)
+  normal_ok <- all((shapiro_tbl$n >= 3) & (!is.na(shapiro_tbl$shapiro_p)) & (shapiro_tbl$shapiro_p > 0.05))
+  var_ok <- !is.na(lev_p) && lev_p > 0.05
+  if (normal_ok && var_ok) {
+    fit <- stats::aov(stats::as.formula(paste0(y, " ~ size_group")), data = dd)
+    an <- summary(fit)[[1]]
+    fval <- as.numeric(an$`F value`[1])
+    df1 <- as.integer(an$Df[1])
+    df2 <- as.integer(an$Df[2])
+    p <- as.numeric(an$`Pr(>F)`[1])
+    omnibus <- tibble::tibble(
+      metric = y,
+      test = "One-way ANOVA",
+      statistic = fval,
+      df = paste0(df1, ", ", df2),
+      p_value = p,
+      sig = stars(p)
+    )
+    tk <- stats::TukeyHSD(fit)[["size_group"]]
+    posthoc <- tibble::as_tibble(tk, rownames = "contrast") |>
+      dplyr::transmute(
+        metric = y,
+        contrast = gsub("-", " vs ", contrast, fixed = TRUE),
+        p_adjusted = `p adj`,
+        sig = stars(`p adj`),
+        method = "Tukey HSD"
+      )
+  } else {
+    kw <- stats::kruskal.test(stats::as.formula(paste0(y, " ~ size_group")), data = dd)
+    omnibus <- tibble::tibble(
+      metric = y,
+      test = "Kruskal-Wallis",
+      statistic = as.numeric(kw$statistic),
+      df = as.character(as.integer(kw$parameter)),
+      p_value = as.numeric(kw$p.value),
+      sig = stars(as.numeric(kw$p.value))
+    )
+    pw <- stats::pairwise.wilcox.test(
+      dd[[y]],
+      dd$size_group,
+      p.adjust.method = "holm",
+      exact = FALSE
+    )
+    pmat <- pw$p.value
+    if (is.null(pmat) || all(is.na(pmat))) {
+      posthoc <- tibble::tibble(
+        metric = y,
+        contrast = NA_character_,
+        p_adjusted = NA_real_,
+        sig = NA_character_,
+        method = NA_character_
+      )
+    } else {
+      posthoc <- as.data.frame(as.table(pmat), stringsAsFactors = FALSE)
+      names(posthoc) <- c("group1", "group2", "p_adjusted")
+      posthoc <- posthoc |>
+        dplyr::filter(!is.na(p_adjusted)) |>
+        dplyr::mutate(
+          metric = y,
+          contrast = paste(group1, "vs", group2),
+          sig = vapply(p_adjusted, stars, character(1)),
+          method = "Pairwise Wilcoxon (Holm)"
+        ) |>
+        dplyr::select(metric, contrast, p_adjusted, sig, method) |>
+        tibble::as_tibble()
+    }
+  }
+  list(
+    assumptions = assumptions,
+    omnibus = omnibus,
+    posthoc = posthoc
+  )
+}
+
+run_spearman_architecture <- function(df, y, x = "avg_terr_diam") {
+  dd <- df |>
+    dplyr::select(dplyr::all_of(c(x, y))) |>
+    dplyr::filter(is.finite(.data[[x]]), is.finite(.data[[y]]))
+  if (nrow(dd) < 3) {
+    return(tibble::tibble(
+      metric = y,
+      n = nrow(dd),
+      rho = NA_real_,
+      p_value = NA_real_,
+      sig = NA_character_
+    ))
+  }
+  if (stats::sd(dd[[x]]) == 0 || stats::sd(dd[[y]]) == 0) {
+    return(tibble::tibble(
+      metric = y,
+      n = nrow(dd),
+      rho = NA_real_,
+      p_value = NA_real_,
+      sig = NA_character_
+    ))
+  }
+  ct <- suppressWarnings(
+    stats::cor.test(
+      x = dd[[x]],
+      y = dd[[y]],
+      method = "spearman",
+      exact = FALSE
+    )
+  )
+  tibble::tibble(
+    metric = y,
+    n = nrow(dd),
+    rho = unname(ct$estimate),
+    p_value = unname(ct$p.value),
+    sig = stars(unname(ct$p.value))
+  )
+}
+
+cer_rds_path <- file.path(folder, "TAIRONA_CERAMICS.rds")
+shp_sites_poly_f <- pick_file(c("TAIRONA_POLYGONS_SITES\\.shp$"), shps)
+shp_structures_f <- pick_file(c("TAIRONA_STRUCTURES\\.shp$"), shps)
+shp_survey_f <- pick_file(c("POLYGON_SURVEY_RIO_FRIO\\.shp$"), shps)
+
+stopifnot(file.exists(cer_rds_path), !is.na(shp_sites_poly_f), !is.na(shp_structures_f))
+
+sites_sf <- sf::st_read(shp_sites_poly_f, quiet = TRUE) |>
+  sf::st_transform(target_crs) |>
+  sf::st_make_valid()
+
+if (!"site_uid" %in% names(sites_sf)) sites_sf$site_uid <- seq_len(nrow(sites_sf))
+if (!"TERRACES" %in% names(sites_sf)) sites_sf$TERRACES <- NA_real_
+if (!"Site_type" %in% names(sites_sf)) sites_sf$Site_type <- NA_character_
+if (!"Site_size" %in% names(sites_sf)) sites_sf$Site_size <- NA_character_
+if (!"Size_HA" %in% names(sites_sf)) {
+  sites_sf$Size_HA <- as.numeric(sf::st_area(sites_sf)) / 10000
+}
+
+structures_sf <- sf::st_read(shp_structures_f, quiet = TRUE) |>
+  sf::st_transform(target_crs)
+
+cer_sf <- readRDS(cer_rds_path) |>
+  sf::st_transform(target_crs)
+
+survey_bg <- if (!is.na(shp_survey_f)) {
+  sf::st_read(shp_survey_f, quiet = TRUE) |>
+    sf::st_transform(target_crs) |>
+    sf::st_make_valid() |>
+    sf::st_union()
+} else {
+  sf::st_convex_hull(sf::st_union(sites_sf))
+}
+survey_bg <- sf::st_sf(geometry = survey_bg)
+
+terr_diam_field <- pick_existing_col(
+  names(structures_sf),
+  candidates = c("Diam_Terra", "Diameter_terraces", "Diamater_terraces", "Terrace_diam", "Terrace_Diam"),
+  regex_patterns = c("Diam.*Terra", "terr.*diam"),
+  required = TRUE,
+  label = "terrace diameter field"
+)
+
+func_field <- pick_existing_col(
+  names(sf::st_drop_geometry(cer_sf)),
+  candidates = c("Function", "Ceramic_ty"),
+  regex_patterns = c("^Function$", "Ceramic"),
+  required = TRUE,
+  label = "ceramic function field"
+)
+
+diam_field <- pick_existing_col(
+  names(sf::st_drop_geometry(cer_sf)),
+  candidates = c("Rim_cm", "Rim", "Rim_Diam", "Rim_Diameter"),
+  regex_patterns = c("^Rim", "diam"),
+  required = FALSE,
+  label = "rim diameter field"
+)
+
+if ("TERRACES" %in% names(sites_sf)) sites_sf$TERRACES[sites_sf$TERRACES == -999] <- NA
+if (terr_diam_field %in% names(structures_sf)) structures_sf[[terr_diam_field]][structures_sf[[terr_diam_field]] == -999] <- NA
+
+struc_join <- sf::st_join(structures_sf, sites_sf["site_uid"]) |>
+  sf::st_drop_geometry()
+
+terr_stats <- struc_join |>
+  dplyr::group_by(site_uid) |>
+  dplyr::summarise(
+    avg_terr_diam = mean(as.numeric(.data[[terr_diam_field]]), na.rm = TRUE),
+    n_terraces_calc = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    avg_terr_diam = ifelse(is.nan(avg_terr_diam), NA_real_, avg_terr_diam)
+  )
+
+buffer_dist_m <- 30
+sites_buffered <- sf::st_buffer(sites_sf, dist = buffer_dist_m)
+
+cer_join <- sf::st_join(cer_sf, sites_buffered["site_uid"], left = FALSE)
+cer_df <- cer_join |>
+  sf::st_drop_geometry()
+
+cer_df <- cer_df |>
+  dplyr::mutate(
+    Function = as.character(.data[[func_field]]),
+    Vessel_Diam = if (!is.na(diam_field)) suppressWarnings(as.numeric(as.character(.data[[diam_field]]))) else NA_real_
+  ) |>
+  dplyr::mutate(
+    Function = dplyr::na_if(Function, "-999"),
+    Function = dplyr::na_if(Function, "NA"),
+    Vessel_Diam = ifelse(Vessel_Diam == -999, NA_real_, Vessel_Diam)
+  ) |>
+  dplyr::filter(!is.na(site_uid), !is.na(Function))
+
+cer_stats <- cer_df |>
+  dplyr::group_by(site_uid) |>
+  dplyr::summarise(
+    avg_vessel_diam = mean(Vessel_Diam, na.rm = TRUE),
+    func_richness = dplyr::n_distinct(Function),
+    n_sherds = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    avg_vessel_diam = ifelse(is.nan(avg_vessel_diam), NA_real_, avg_vessel_diam)
+  )
+
+sites_attr_base <- sites_sf |>
+  sf::st_drop_geometry() |>
+  tibble::as_tibble()
+
+if (!"TERRACES" %in% names(sites_attr_base)) sites_attr_base$TERRACES <- NA_real_
+if (!"Site_type" %in% names(sites_attr_base)) sites_attr_base$Site_type <- NA_character_
+if (!"Site_size" %in% names(sites_attr_base)) sites_attr_base$Site_size <- NA_character_
+if (!"Size_HA" %in% names(sites_attr_base)) sites_attr_base$Size_HA <- NA_real_
+
+sites_attr <- sites_attr_base |>
+  dplyr::select(site_uid, TERRACES, Site_type, Site_size, Size_HA) |>
+  dplyr::left_join(terr_stats, by = "site_uid") |>
+  dplyr::left_join(cer_stats, by = "site_uid") |>
+  dplyr::mutate(
+    TERRACES = tidyr::replace_na(as.numeric(TERRACES), 0),
+    avg_terr_diam = tidyr::replace_na(as.numeric(avg_terr_diam), 0),
+    avg_vessel_diam = tidyr::replace_na(as.numeric(avg_vessel_diam), 0),
+    func_richness = tidyr::replace_na(as.numeric(func_richness), 0),
+    n_sherds = tidyr::replace_na(as.numeric(n_sherds), 0),
+    n_terraces_calc = tidyr::replace_na(as.numeric(n_terraces_calc), 0),
+    norm_n_terr = norm_minmax(TERRACES),
+    norm_diam_terr = norm_minmax(avg_terr_diam),
+    norm_diam_vess = norm_minmax(avg_vessel_diam),
+    norm_richness = norm_minmax(func_richness),
+    norm_sherds = norm_minmax(n_sherds),
+    complexity_index = (norm_n_terr + norm_diam_terr + norm_diam_vess + norm_richness + norm_sherds) / 5
+  )
+
+sites_net <- sites_attr |>
+  dplyr::filter(n_sherds > 0) |>
+  dplyr::arrange(site_uid)
+
+stopifnot(nrow(sites_net) > 2)
+
+X_comp <- sites_net |>
+  dplyr::select(norm_n_terr, norm_diam_terr, norm_diam_vess, norm_richness, norm_sherds) |>
+  as.matrix()
+X_comp[is.na(X_comp)] <- 0
+
+bc_dist <- function(x, y) {
+  sx <- sum(x)
+  sy <- sum(y)
+  if ((sx + sy) == 0) return(1)
+  1 - (2 * sum(pmin(x, y))) / (sx + sy)
+}
+
+n_sites <- nrow(X_comp)
+D_matrix <- matrix(0, n_sites, n_sites)
+
+for (i in seq_len(n_sites)) {
+  for (j in i:n_sites) {
+    dij <- bc_dist(X_comp[i, ], X_comp[j, ])
+    D_matrix[i, j] <- dij
+    D_matrix[j, i] <- dij
+  }
+}
+
+diag(D_matrix) <- 0
+D_matrix[!is.finite(D_matrix)] <- 1
+
+S_matrix <- 1 - D_matrix
+S_matrix[!is.finite(S_matrix)] <- 0
+S_matrix <- pmin(pmax(S_matrix, 0), 1)
+
+k_nn <- 3
+edges_list <- vector("list", n_sites)
+
+for (i in seq_len(n_sites)) {
+  ord <- order(S_matrix[i, ], decreasing = TRUE, na.last = NA)
+  ord <- ord[ord != i]
+  targets <- head(ord, k_nn)
+  targets <- targets[S_matrix[i, targets] > 0.0001]
+  if (length(targets) > 0) {
+    edges_list[[i]] <- data.frame(
+      from = as.character(i),
+      to = as.character(targets),
+      weight = as.numeric(S_matrix[i, targets]),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+edges_df_raw <- dplyr::bind_rows(edges_list)
+stopifnot(nrow(edges_df_raw) > 0)
+
+edges_clean <- edges_df_raw |>
+  dplyr::mutate(
+    from_num = as.numeric(from),
+    to_num = as.numeric(to),
+    key = paste(pmin(from_num, to_num), pmax(from_num, to_num), sep = "_")
+  ) |>
+  dplyr::group_by(key) |>
+  dplyr::summarise(
+    from = dplyr::first(from),
+    to = dplyr::first(to),
+    weight = max(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::select(from, to, weight)
+
+vertices_df <- data.frame(
+  name = as.character(seq_len(n_sites)),
+  stringsAsFactors = FALSE
+)
+
+g <- igraph::graph_from_data_frame(
+  d = edges_clean,
+  directed = FALSE,
+  vertices = vertices_df
+)
+
+match_idx <- match(igraph::V(g)$name, vertices_df$name)
+igraph::V(g)$site_uid <- sites_net$site_uid[match_idx]
+igraph::V(g)$complexity <- as.numeric(sites_net$complexity_index[match_idx])
+
+eps <- 1e-6
+edge_sim <- pmax(as.numeric(igraph::E(g)$weight), eps)
+edge_dist <- 1 / edge_sim
+
+igraph::V(g)$betweenness <- igraph::betweenness(
+  g,
+  weights = edge_dist,
+  normalized = TRUE
+)
+
+eig_raw <- igraph::eigen_centrality(
+  g,
+  weights = edge_sim,
+  directed = FALSE,
+  scale = TRUE
+)$vector
+igraph::V(g)$eigenvector <- as.numeric(eig_raw)
+
+clo_raw <- suppressWarnings(
+  igraph::closeness(g, weights = edge_dist, normalized = TRUE)
+)
+igraph::V(g)$closeness <- as.numeric(clo_raw)
+
+igraph::V(g)$lcc <- igraph::transitivity(
+  g,
+  type = "localundirected",
+  isolates = "zero"
+)
+
+net_summary <- tibble::tibble(
+  site_uid = igraph::V(g)$site_uid,
+  complexity = as.numeric(igraph::V(g)$complexity),
+  betweenness = as.numeric(igraph::V(g)$betweenness),
+  eigenvector = as.numeric(igraph::V(g)$eigenvector),
+  closeness = as.numeric(igraph::V(g)$closeness),
+  lcc = as.numeric(igraph::V(g)$lcc)
+) |>
+  dplyr::left_join(
+    sites_net |>
+      dplyr::select(
+        site_uid,
+        dplyr::any_of(c(
+          "TERRACES", "Site_type", "Site_size", "Size_HA",
+          "avg_terr_diam", "n_terraces_calc",
+          "avg_vessel_diam", "func_richness",
+          "n_sherds", "complexity_index"
+        ))
+      ),
+    by = "site_uid"
+  )
+
+size_groups <- NULL
+
+if ("Site_type" %in% names(sites_sf)) {
+  size_groups <- sites_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::transmute(
+      site_uid,
+      size_group = standardize_size_group(Site_type)
+    )
+}
+
+if ((is.null(size_groups) || all(is.na(size_groups$size_group))) && "Site_size" %in% names(sites_sf)) {
+  size_groups <- sites_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::transmute(
+      site_uid,
+      size_group = standardize_size_group(Site_size)
+    )
+}
+
+if (is.null(size_groups) || all(is.na(size_groups$size_group))) {
+  size_groups <- sites_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::transmute(
+      site_uid,
+      size_group = factor(
+        cut(
+          Size_HA,
+          breaks = c(-Inf, 0.5, 1, Inf),
+          labels = c("Small sites", "Medium sites", "Large sites"),
+          right = TRUE
+        ),
+        levels = c("Small sites", "Medium sites", "Large sites")
+      )
+    )
+}
+
+dat_test <- net_summary |>
+  dplyr::left_join(size_groups, by = "site_uid") |>
+  dplyr::filter(!is.na(size_group)) |>
+  dplyr::mutate(
+    size_group = factor(size_group, levels = c("Small sites", "Medium sites", "Large sites"))
+  )
+
+present_levels <- levels(dat_test$size_group)[levels(dat_test$size_group) %in% unique(as.character(dat_test$size_group))]
+dat_test$size_group <- factor(dat_test$size_group, levels = present_levels)
+
+metrics <- c("complexity", "betweenness", "eigenvector", "closeness", "lcc")
+
+desc_tbl <- dplyr::bind_rows(lapply(metrics, function(m) desc_table(dat_test, m))) |>
+  dplyr::arrange(metric, size_group)
+
+res_list <- lapply(metrics, function(m) run_tests_one_metric(dat_test, m))
+
+assumptions_tbl <- dplyr::bind_rows(lapply(res_list, `[[`, "assumptions")) |>
+  dplyr::arrange(metric, group)
+
+omnibus_tbl <- dplyr::bind_rows(lapply(res_list, `[[`, "omnibus")) |>
+  dplyr::arrange(metric, p_value)
+
+posthoc_tbl <- dplyr::bind_rows(lapply(res_list, `[[`, "posthoc")) |>
+  dplyr::arrange(metric, p_adjusted)
+
+knitr::kable(
+  assumptions_tbl,
+  digits = 6,
+  caption = "Network analysis: normality and homogeneity checks by site-size class"
+)
+
+knitr::kable(
+  desc_tbl,
+  digits = 6,
+  caption = "Network analysis: descriptive statistics by site-size class"
+)
+
+knitr::kable(
+  omnibus_tbl,
+  digits = 6,
+  caption = "Network analysis: omnibus group-comparison tests"
+)
+
+knitr::kable(
+  posthoc_tbl,
+  digits = 6,
+  caption = "Network analysis: Holm-adjusted post-hoc comparisons"
+)
+
+arch_metrics <- c("betweenness", "eigenvector", "closeness", "lcc")
+
+arch_corr_tbl <- dplyr::bind_rows(
+  lapply(arch_metrics, function(m) run_spearman_architecture(net_summary, m, x = "avg_terr_diam"))
+) |>
+  dplyr::mutate(
+    p_value_label = vapply(p_value, format_p, character(1))
+  )
+
+knitr::kable(
+  arch_corr_tbl |>
+    dplyr::select(metric, n, rho, p_value, sig),
+  digits = 6,
+  caption = "Network analysis: Spearman correlations between mean terrace diameter and network metrics"
+)
+
+nodes_sf <- sf::st_point_on_surface(sites_sf) |>
+  dplyr::select(site_uid) |>
+  dplyr::inner_join(net_summary, by = "site_uid")
+
+coords <- sf::st_coordinates(nodes_sf)
+
+edge_lines_list <- lapply(seq_len(igraph::ecount(g)), function(i) {
+  eidx <- igraph::ends(g, i, names = FALSE)
+  sf::st_linestring(
+    matrix(
+      c(coords[eidx[1], ], coords[eidx[2], ]),
+      ncol = 2,
+      byrow = TRUE
+    )
+  )
+})
+
+edges_sf <- sf::st_sf(
+  weight = edge_sim,
+  geometry = sf::st_sfc(edge_lines_list, crs = sf::st_crs(nodes_sf))
+)
+
+edges_sf$weight_cat <- cut(
+  edges_sf$weight,
+  breaks = c(-0.1, 0.00, 0.25, 0.50, 0.75, 1.00),
+  labels = c("0.00", "0.25", "0.50", "0.75", "1.00"),
+  include.lowest = TRUE
+)
+
+edge_width_vals <- c(
+  "0.00" = 0.2,
+  "0.25" = 0.5,
+  "0.50" = 0.8,
+  "0.75" = 1.2,
+  "1.00" = 1.8
+)
+
+north_style <- ggspatial::north_arrow_fancy_orienteering
+
+base_map <- function(alpha_edges = 0.55, show_edge_legend = FALSE) {
+  ggplot2::ggplot() +
+    ggplot2::geom_sf(data = survey_bg, fill = "grey90", color = "black", linewidth = 0.5) +
+    ggplot2::geom_sf(
+      data = edges_sf,
+      ggplot2::aes(linewidth = weight_cat),
+      color = "grey40",
+      alpha = alpha_edges
+    ) +
+    ggplot2::scale_linewidth_manual(
+      values = edge_width_vals,
+      name = "Bray-Curtis\nSimilarity",
+      guide = if (show_edge_legend) ggplot2::guide_legend(order = 2) else "none"
+    ) +
+    ggspatial::annotation_north_arrow(location = "tl", style = north_style) +
+    ggspatial::annotation_scale(location = "bl", width_hint = 0.2) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 12),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 9, color = "grey30"),
+      legend.position = "right"
+    )
+}
+
+pA <- base_map(show_edge_legend = TRUE) +
+  ggplot2::geom_sf(
+    data = nodes_sf,
+    ggplot2::aes(size = complexity, fill = betweenness),
+    shape = 21,
+    color = "black",
+    stroke = 0.25
+  ) +
+  ggplot2::scale_size_continuous(
+    name = "Ceramic Complexity\nIndex (0-1)",
+    range = c(1.5, 7),
+    limits = c(0, 1),
+    guide = ggplot2::guide_legend(order = 1)
+  ) +
+  viridis::scale_fill_viridis(
+    option = "viridis",
+    name = "Betweenness",
+    guide = ggplot2::guide_colorbar(order = 3)
+  ) +
+  ggplot2::labs(
+    title = "A. Betweenness",
+    subtitle = "Fill: Betweenness | Size: Complexity"
+  )
+
+pB <- base_map() +
+  ggplot2::geom_sf(
+    data = nodes_sf,
+    ggplot2::aes(size = complexity, fill = eigenvector),
+    shape = 21,
+    color = "black",
+    stroke = 0.25
+  ) +
+  ggplot2::scale_size_continuous(
+    name = "Ceramic Complexity\nIndex (0-1)",
+    range = c(1.5, 7),
+    limits = c(0, 1),
+    guide = ggplot2::guide_legend(order = 1)
+  ) +
+  viridis::scale_fill_viridis(
+    option = "magma",
+    name = "Eigenvector",
+    guide = ggplot2::guide_colorbar(order = 3)
+  ) +
+  ggplot2::labs(
+    title = "B. Eigenvector",
+    subtitle = "Fill: Eigenvector | Size: Complexity"
+  )
+
+pC <- base_map() +
+  ggplot2::geom_sf(
+    data = nodes_sf,
+    ggplot2::aes(size = complexity, fill = closeness),
+    shape = 21,
+    color = "black",
+    stroke = 0.25
+  ) +
+  ggplot2::scale_size_continuous(
+    name = "Ceramic Complexity\nIndex (0-1)",
+    range = c(1.5, 7),
+    limits = c(0, 1),
+    guide = ggplot2::guide_legend(order = 1)
+  ) +
+  viridis::scale_fill_viridis(
+    option = "plasma",
+    name = "Closeness",
+    guide = ggplot2::guide_colorbar(order = 3)
+  ) +
+  ggplot2::labs(
+    title = "C. Closeness",
+    subtitle = "Fill: Closeness | Size: Complexity"
+  )
+
+pD <- base_map() +
+  ggplot2::geom_sf(
+    data = nodes_sf,
+    ggplot2::aes(size = complexity, fill = lcc),
+    shape = 21,
+    color = "black",
+    stroke = 0.25
+  ) +
+  ggplot2::scale_size_continuous(
+    name = "Ceramic Complexity\nIndex (0-1)",
+    range = c(1.5, 7),
+    limits = c(0, 1),
+    guide = ggplot2::guide_legend(order = 1)
+  ) +
+  viridis::scale_fill_viridis(
+    option = "cividis",
+    name = "Local Clustering",
+    guide = ggplot2::guide_colorbar(order = 3)
+  ) +
+  ggplot2::labs(
+    title = "D. Local Clustering",
+    subtitle = "Fill: Local Clustering | Size: Complexity"
+  )
+
+p_all <- (pA | pB) / (pC | pD) +
+  patchwork::plot_layout(guides = "keep")
+
+print(p_all)
+```
