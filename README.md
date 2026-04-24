@@ -19,7 +19,7 @@ Repository Structure:
      • regression_data.rds
 
 2. R Code Files:
-   - The main R Markdown file (FINAL_JARE_MARKDOWN_SPRING_2026.Rmd) contains the code to:
+   - The main R Markdown file (JARE_MARKDOWN_SPRING_2026.Rmd) contains the code to:
      a) Load required packages.
      b) Download the datasets and GIS files directly from GitHub.
      c) Process the data, build similarity matrices, calculate centrality metrics, and perform network analysis.
