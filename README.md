@@ -1,4 +1,4 @@
-Centralization and integration in Tairona chiefdoms of the Río Frío basin, Sierra Nevada de Santa Marta, Colombia (under review)
+Centralization and integration in Tairona chiefdoms of the Río Frío basin, Sierra Nevada de Santa Marta, Colombia
 --------------------------------------------------------------
 
 This repository contains the R code and data used to analyze the processes of political integration and socioeconomic centralization in Tairona chiefdom communities of the Río Frío basin (Sierra Nevada de Santa Marta, Colombia) during the Tairona period (approximately 10th to 16th centuries AD).
